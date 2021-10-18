@@ -1,4 +1,5 @@
 use crc32c::*;
+use fs2::FileExt;
 use std::cmp::Ordering;
 use std::convert::TryInto;
 use std::fs::{File, OpenOptions};
@@ -6,7 +7,7 @@ use std::io::Result;
 use std::iter;
 use std::ops::Bound::*;
 use std::ops::{Bound, RangeBounds};
-use std::os::unix::prelude::FileExt;
+use std::os::unix::prelude::FileExt as UnixFileExt;
 use std::path::Path;
 use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -65,6 +66,20 @@ enum AccessMode {
 }
 
 ///
+/// Status of automatic database recovery after open.
+/// In case of start after normal shutdown all fields should be zero.
+///
+#[derive(Clone, Copy, Default)]
+pub struct RecoveryStatus {
+    /// number of recovered transactions
+    pub recovered_transactions: u64,
+    /// size of WAL at the moment of recovery
+    pub wal_size: u64,
+    /// position of last recovery transaction in WAL
+    pub recovery_end: u64,
+}
+
+///
 /// Abstract storage bidirectional iterator
 ///
 pub struct StorageIterator<'a> {
@@ -88,12 +103,13 @@ struct PagePos {
 //
 struct TreePath {
     curr: Option<(Key, Value)>, // current (key,value) pair if any
-    stack: Vec<PagePos>,        // stack of positions in B-Tree
-    lsn: LSN,                   // LSN of last operation
+    result: Option<Result<(Key, Value)>>,
+    stack: Vec<PagePos>, // stack of positions in B-Tree
+    lsn: LSN,            // LSN of last operation
 }
 
 impl<'a> Iterator for StorageIterator<'a> {
-    type Item = (Key, Value);
+    type Item = Result<(Key, Value)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.left.stack.len() == 0 {
@@ -104,8 +120,8 @@ impl<'a> Iterator for StorageIterator<'a> {
                 Bound::Excluded(key) => {
                     self.storage
                         .lookup(LookupOp::GreaterOrEqual(key), &mut self.left);
-                    if let Some(curr) = &self.left.curr {
-                        if curr.0 == *key {
+                    if let Some((curr_key, _value)) = &self.left.curr {
+                        if curr_key == key {
                             self.storage.lookup(LookupOp::Next, &mut self.left);
                         }
                     }
@@ -115,22 +131,22 @@ impl<'a> Iterator for StorageIterator<'a> {
         } else {
             self.storage.lookup(LookupOp::Next, &mut self.left);
         }
-        if let Some(curr) = &self.left.curr {
+        if let Some((curr_key, _value)) = &self.left.curr {
             match &self.till {
                 Bound::Included(key) => {
-                    if curr.0 > *key {
+                    if curr_key > key {
                         return None;
                     }
                 }
                 Bound::Excluded(key) => {
-                    if curr.0 >= *key {
+                    if curr_key >= key {
                         return None;
                     }
                 }
                 Bound::Unbounded => {}
             }
         }
-        self.left.curr.clone()
+        self.left.result.take()
     }
 }
 
@@ -141,8 +157,8 @@ impl<'a> DoubleEndedIterator for StorageIterator<'a> {
                 Bound::Included(key) => {
                     self.storage
                         .lookup(LookupOp::GreaterOrEqual(key), &mut self.right);
-                    if let Some(curr) = &self.right.curr {
-                        if curr.0 > *key {
+                    if let Some((curr_key, _value)) = &self.right.curr {
+                        if curr_key > key {
                             self.storage.lookup(LookupOp::Prev, &mut self.right);
                         }
                     } else {
@@ -152,8 +168,8 @@ impl<'a> DoubleEndedIterator for StorageIterator<'a> {
                 Bound::Excluded(key) => {
                     self.storage
                         .lookup(LookupOp::GreaterOrEqual(key), &mut self.right);
-                    if let Some(curr) = &self.right.curr {
-                        if curr.0 >= *key {
+                    if let Some((curr_key, _value)) = &self.right.curr {
+                        if curr_key >= key {
                             self.storage.lookup(LookupOp::Prev, &mut self.right);
                         }
                     } else {
@@ -165,22 +181,22 @@ impl<'a> DoubleEndedIterator for StorageIterator<'a> {
         } else {
             self.storage.lookup(LookupOp::Prev, &mut self.right);
         }
-        if let Some(curr) = &self.right.curr {
+        if let Some((curr_key, _value)) = &self.right.curr {
             match &self.from {
                 Bound::Included(key) => {
-                    if curr.0 < *key {
+                    if curr_key < key {
                         return None;
                     }
                 }
                 Bound::Excluded(key) => {
-                    if curr.0 <= *key {
+                    if curr_key <= key {
                         return None;
                     }
                 }
                 Bound::Unbounded => {}
             }
         }
-        self.right.curr.clone()
+        self.right.result.take()
     }
 }
 
@@ -248,10 +264,11 @@ impl Metadata {
 // Database shared state
 //
 struct Database {
-    meta: Metadata,       // cached metadata (stored in root page)
-    lsn: LSN,             // database modification counter
-    state: DatabaseState, // database state
-    wal_pos: u64,         // current opsition in log file
+    meta: Metadata,           // cached metadata (stored in root page)
+    lsn: LSN,                 // database modification counter
+    state: DatabaseState,     // database state
+    wal_pos: u64,             // current opsition in log file
+    recovery: RecoveryStatus, // status of recovery
 }
 
 //
@@ -331,7 +348,7 @@ impl PageData {
         } else {
             self.get_offs(ip - 1)
         };
-        assert!(next_offs > offs);
+        debug_assert!(next_offs > offs);
         (offs, next_offs - offs)
     }
 
@@ -392,8 +409,16 @@ impl PageData {
             self.set_offs(i - 1, self.get_offs(i) + item_len);
         }
         let items_origin = PAGE_SIZE - size;
-        self.data
-            .copy_within(items_origin..item_offs, items_origin + item_len);
+        if n_items > 1 && ip + 1 == n_items && self.data[item_offs] == 0 {
+            // If we are removing last child of internal page with +inf key,
+            // then we should replace key of previous item with +inf
+            let prev_key_len = self.data[item_offs + item_len] as usize;
+            self.set_offs(ip - 1, item_offs + item_len + prev_key_len);
+            self.data[item_offs + item_len + prev_key_len] = 0u8; // zero length means +inf
+        } else {
+            self.data
+                .copy_within(items_origin..item_offs, items_origin + item_len);
+        }
         self.set_n_items(n_items - 1);
     }
 
@@ -405,9 +430,9 @@ impl PageData {
         let size = self.get_size();
         let key_len = key.len();
         let item_len = 1 + key_len + value.len();
-        if (n_items + 1) * 2 + item_len <= PAGE_SIZE - PAGE_HEADER_SIZE {
+        if (n_items + 1) * 2 + size + item_len <= PAGE_SIZE - PAGE_HEADER_SIZE {
             // fit in page
-            for i in ip..n_items {
+            for i in (ip..n_items).rev() {
                 self.set_offs(i + 1, self.get_offs(i) - item_len);
             }
             let item_offs = if ip != 0 {
@@ -430,7 +455,8 @@ impl PageData {
     }
 
     //
-    // Split page into two approximately equal parts. Smallest keys are moved to the new page, larger - left on original page.
+    // Split page into two approximately equal parts. Smallest keys are moved to the new page,
+    // largest - left on original page.
     // Returns split position
     //
     fn split(&mut self, new_page: &mut PageData) -> ItemPointer {
@@ -448,8 +474,8 @@ impl PageData {
                 r = m;
             }
         }
-        assert!(l == r);
-        // Move first r elements to the new page
+        debug_assert!(l == r);
+        // Move first r+1 elements to the new page
         let moved_size = PAGE_SIZE - self.get_offs(r);
 
         // copy item pointers
@@ -476,7 +502,7 @@ impl BufferManager {
     // Link buffer to the head of LRU list (make it acceptable for eviction)
     //
     fn unpin(&mut self, id: BufferId) {
-        assert!(self.pages[id as usize].access_count == 1);
+        debug_assert!(self.pages[id as usize].access_count == 1);
         self.pages[id as usize].access_count = 0;
         self.pages[id as usize].next = self.head;
         self.pages[id as usize].prev = 0;
@@ -492,17 +518,17 @@ impl BufferManager {
     // Unlink buffer from LRU list and so pin it in memory (protect from eviction)
     //
     fn pin(&mut self, id: BufferId) {
-        assert!(self.pages[id as usize].access_count == 0);
-        if self.pages[id as usize].prev == 0 {
+        debug_assert!(self.pages[id as usize].access_count == 0);
+        let prev = self.pages[id as usize].prev as usize;
+        if prev == 0 {
             self.head = self.pages[id as usize].next;
         } else {
-            let prev = self.pages[id as usize].prev as usize;
             self.pages[prev].next = self.pages[id as usize].next;
         }
-        if self.pages[id as usize].next == 0 {
+        let next = self.pages[id as usize].next as usize;
+        if next == 0 {
             self.tail = self.pages[id as usize].prev;
         } else {
-            let next = self.pages[id as usize].next as usize;
             self.pages[next].prev = self.pages[id as usize].prev;
         }
     }
@@ -545,10 +571,10 @@ impl BufferManager {
     // If buffer is not yet marked as dirty then mark it as dirty and pin until the end of transaction
     //
     fn modify_buffer(&mut self, id: BufferId) {
-        assert!(self.pages[id as usize].access_count > 0);
+        debug_assert!(self.pages[id as usize].access_count > 0);
         if (self.pages[id as usize].state & PAGE_DIRTY) == 0 {
             self.pages[id as usize].access_count += 1; // pin dirty page in memory
-            self.pages[id as usize].state |= PAGE_DIRTY;
+            self.pages[id as usize].state = PAGE_DIRTY;
             self.pages[id as usize].next = self.dirty_pages;
             self.dirty_pages = id;
         }
@@ -558,17 +584,17 @@ impl BufferManager {
     // Decrement buffer's access counter and release buffer if it is last reference
     //
     fn release_buffer(&mut self, id: BufferId) {
-        let access_count = self.pages[id as usize].access_count;
-        assert!(access_count > 0);
-        self.pages[id as usize].access_count = access_count - 1;
-        if access_count == 1 {
-            assert!((self.pages[id as usize].state & PAGE_DIRTY) == 0);
+        debug_assert!(self.pages[id as usize].access_count > 0);
+        if self.pages[id as usize].access_count == 1 {
+            debug_assert!((self.pages[id as usize].state & PAGE_DIRTY) == 0);
             self.unpin(id);
+        } else {
+            self.pages[id as usize].access_count -= 1;
         }
     }
 
     //
-    // Allocate new buffer
+    // Find buffer with specified page or allocate new buffer
     //
     fn get_buffer(&mut self, pid: PageId) -> BufferId {
         let hash = pid as usize % self.hash_table.len();
@@ -576,7 +602,7 @@ impl BufferManager {
         while h != 0 {
             if self.pages[h as usize].id == pid {
                 let access_count = self.pages[h as usize].access_count;
-                assert!(access_count < u16::MAX - 1);
+                debug_assert!(access_count < u16::MAX - 1);
                 if access_count == 0 {
                     self.pin(h);
                 }
@@ -591,15 +617,15 @@ impl BufferManager {
             // has some free pages
             self.free_pages = self.pages[h as usize].next;
         } else {
-            if (self.used as usize) < self.hash_table.len() {
-                h = self.used;
+            h = self.used;
+            if (h as usize) < self.hash_table.len() {
                 self.used += 1;
             } else {
                 // Replace least recently used page
                 let victim = self.tail;
                 assert!(victim != 0);
-                assert!(self.pages[victim as usize].access_count == 0);
-                assert!((self.pages[victim as usize].state & PAGE_DIRTY) == 0);
+                debug_assert!(self.pages[victim as usize].access_count == 0);
+                debug_assert!((self.pages[victim as usize].state & PAGE_DIRTY) == 0);
                 self.pin(victim);
                 self.remove(victim);
                 h = victim;
@@ -672,6 +698,7 @@ impl Storage {
             // Some other thread is loading buffer: just wait until it done
             bm.pages[buf as usize].state |= PAGE_WAIT;
             loop {
+                debug_assert!((bm.pages[buf as usize].state & PAGE_WAIT) != 0);
                 bm = self.busy_events[buf as usize % N_BUSY_EVENTS]
                     .wait(bm)
                     .unwrap();
@@ -736,8 +763,10 @@ impl Storage {
             if bm.dirty_pages != 0 {
                 let mut buf = [0u8; METADATA_SIZE + 8];
                 let meta = db.meta.pack();
-                let mut page = self.pool[0].write().unwrap();
-                page.data[0..METADATA_SIZE].copy_from_slice(&meta);
+                {
+                    let mut page = self.pool[0].write().unwrap();
+                    page.data[0..METADATA_SIZE].copy_from_slice(&meta);
+                }
                 buf[4..4 + METADATA_SIZE].copy_from_slice(&meta);
                 crc = crc32c_append(crc, &buf[..4 + METADATA_SIZE]);
                 buf[4 + METADATA_SIZE..].copy_from_slice(&crc.to_be_bytes());
@@ -745,46 +774,54 @@ impl Storage {
                 db.wal_pos += (8 + METADATA_SIZE) as u64;
                 log.sync_all()?;
                 db.lsn += 1;
-            }
-            // Write pages to the data file
-            self.flush_buffers(bm)?;
 
-            if db.wal_pos >= self.checkpoint_interval {
-                // Sync data file and restart from the beginning of WAL.
-                // So not truncate WAL to avoid file extension overhead.
-                self.file.sync_all()?;
-                db.wal_pos = 0;
+                // Write pages to the data file
+                self.flush_buffers(bm)?;
+
+                if db.wal_pos >= self.checkpoint_interval {
+                    // Sync data file and restart from the beginning of WAL.
+                    // So not truncate WAL to avoid file extension overhead.
+                    self.file.sync_all()?;
+                    db.wal_pos = 0;
+                }
             }
         } else {
             // No WAL mode: just write dirty pages to the disk
-            self.flush_buffers(bm)?;
-            db.lsn += 1;
+            if self.flush_buffers(bm)? {
+                let meta = db.meta.pack();
+                let mut page = self.pool[0].write().unwrap();
+                page.data[0..METADATA_SIZE].copy_from_slice(&meta);
+                db.lsn += 1;
+            }
         }
         Ok(())
     }
 
     //
-    // Flush dirty pages to the disk
+    // Flush dirty pages to the disk. Return true if database is changed.
     //
-    fn flush_buffers(&self, mut bm: MutexGuard<BufferManager>) -> Result<()> {
+    fn flush_buffers(&self, mut bm: MutexGuard<BufferManager>) -> Result<bool> {
         let mut dirty = bm.dirty_pages;
         while dirty != 0 {
             let pid = bm.pages[dirty as usize].id;
             let file_offs = pid as u64 * PAGE_SIZE as u64;
             let page = self.pool[dirty as usize].read().unwrap();
+            let next = bm.pages[dirty as usize].next;
             self.file.write_all_at(&page.data, file_offs)?;
-            assert!((bm.pages[dirty as usize].state & PAGE_DIRTY) != 0);
+            debug_assert!(bm.pages[dirty as usize].state == PAGE_DIRTY);
             bm.pages[dirty as usize].state = 0;
             bm.unpin(dirty);
-            dirty = bm.pages[dirty as usize].next;
+            dirty = next;
         }
         if bm.dirty_pages != 0 {
             // Save metadata page
             bm.dirty_pages = 0;
             let page = self.pool[0].read().unwrap();
             self.file.write_all_at(&page.data, 0)?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(())
     }
 
     //
@@ -796,10 +833,11 @@ impl Storage {
 
         // Just throw away all dirty pages from buffer cache to force reloading of original pages
         while dirty != 0 {
-            assert!((bm.pages[dirty as usize].state & PAGE_DIRTY) != 0);
-            assert!(bm.pages[dirty as usize].access_count == 1);
+            debug_assert!((bm.pages[dirty as usize].state & PAGE_DIRTY) != 0);
+            debug_assert!(bm.pages[dirty as usize].access_count == 1);
+            let next = bm.pages[dirty as usize].next;
             bm.throw_buffer(dirty);
-            dirty = bm.pages[dirty as usize].next;
+            dirty = next;
         }
         if bm.dirty_pages != 0 {
             // reread metadata from disk
@@ -827,6 +865,7 @@ impl Storage {
         let (file, meta) = if let Ok(file) = OpenOptions::new().write(true).read(true).open(db_path)
         {
             // open existed file
+            file.try_lock_exclusive()?;
             file.read_exact_at(&mut buf, 0)?;
             let meta = Metadata::unpack(&buf);
             assert!(meta.magic == MAGIC && meta.version == VERSION && meta.size >= 1);
@@ -837,6 +876,7 @@ impl Storage {
                 .read(true)
                 .create(true)
                 .open(db_path)?;
+            file.try_lock_exclusive()?;
             // create new file
             let meta = Metadata {
                 magic: MAGIC,
@@ -852,13 +892,13 @@ impl Storage {
             (file, meta)
         };
         let log = if let Some(path) = log_path {
-            Some(
-                OpenOptions::new()
-                    .write(true)
-                    .read(true)
-                    .create(true)
-                    .open(path)?,
-            )
+            let log = OpenOptions::new()
+                .write(true)
+                .read(true)
+                .create(true)
+                .open(path)?;
+            log.try_lock_exclusive()?;
+            Some(log)
         } else {
             None
         };
@@ -882,6 +922,9 @@ impl Storage {
             db: RwLock::new(Database {
                 lsn: 0,
                 meta,
+                recovery: RecoveryStatus {
+                    ..Default::default()
+                },
                 state: DatabaseState::InRecovery,
                 wal_pos: 0,
             }),
@@ -899,6 +942,7 @@ impl Storage {
             let mut buf = [0u8; 4];
             let mut crc = 0u32;
             let mut wal_pos = 0u64;
+            db.recovery.wal_size = log.metadata()?.len();
             loop {
                 let len = log.read_at(&mut buf, wal_pos)?;
                 if len != 4 {
@@ -932,26 +976,30 @@ impl Storage {
                     wal_pos += 4;
                     if u32::from_be_bytes(buf) != crc {
                         // CRC mismatch
-                        println!("CRC mismatch for log page {}", wal_pos);
                         break;
                     }
-                    let mut page = self.pool[0].write().unwrap();
-                    page.data[0..METADATA_SIZE].copy_from_slice(&meta_buf);
+                    {
+                        let mut page = self.pool[0].write().unwrap();
+                        page.data[0..METADATA_SIZE].copy_from_slice(&meta_buf);
+                    }
                     let bm = self.buf_mgr.lock().unwrap();
                     self.flush_buffers(bm)?;
+                    db.recovery.recovered_transactions += 1;
+                    db.recovery.recovery_end = wal_pos;
                 }
             }
             self.rollback(&mut db)?;
-
-            // reread metadata
-            let page = self.pool[0].read().unwrap();
-            db.meta = Metadata::unpack(&page.data);
 
             // reset WAL
             self.file.sync_all()?;
             db.wal_pos = 0;
             log.set_len(0)?; // truncate log
         }
+        // reread metadata
+        let mut page = self.pool[0].write().unwrap();
+        self.file.read_exact_at(&mut page.data, 0)?;
+        db.meta = Metadata::unpack(&page.data);
+
         db.state = DatabaseState::Opened;
 
         Ok(())
@@ -1065,7 +1113,7 @@ impl Storage {
                 r = m;
             }
         }
-        assert!(l == r);
+        debug_assert!(l == r);
         if height == 1 {
             // leaf page
             if r < n && page.compare_key(r, key) == Ordering::Equal {
@@ -1074,6 +1122,7 @@ impl Storage {
             }
         } else {
             // recurse to next level
+            debug_assert!(r < n);
             let underflow = self.btree_remove(db, page.get_child(r), key, height - 1)?;
             if underflow {
                 self.modify_page(pin.buf);
@@ -1114,7 +1163,7 @@ impl Storage {
                 r = m;
             }
         }
-        assert!(l == r);
+        debug_assert!(l == r);
         if height == 1 {
             // leaf page
             self.modify_page(pin.buf);
@@ -1125,6 +1174,7 @@ impl Storage {
             Ok(self.btree_insert_in_page(db, &mut page, r, key, value))
         } else {
             // recurse to next level
+            debug_assert!(r < n);
             let overflow = self.btree_insert(db, page.get_child(r), key, value, height - 1)?;
             if let Some((key, child)) = overflow {
                 // insert new page before original
@@ -1173,21 +1223,24 @@ impl Storage {
     fn do_remove(&self, db: &mut RwLockWriteGuard<Database>, key: &Key) -> Result<()> {
         if db.meta.root != 0 {
             let underflow = self.btree_remove(db, db.meta.root, key, db.meta.height)?;
-            assert!(!underflow); // underflow not possible because of +inf page
+            if underflow {
+                db.meta.height = 0;
+                db.meta.root = 0;
+            }
         }
         Ok(())
     }
 
     //
     // Perform lookup operation and fill `path` structure with located item and path to it in the tree.
-    // If item is not found, then path is empty and current element is `None`.
+    // If item is not found, then make path empty and current element `None`.
     //
     fn do_lookup(
         &self,
         db: &RwLockReadGuard<Database>,
         op: LookupOp,
         path: &mut TreePath,
-    ) -> Result<()> {
+    ) -> Result<Option<(Key, Value)>> {
         match op {
             LookupOp::First => {
                 // Locate left-most element in the tree
@@ -1246,20 +1299,20 @@ impl Storage {
                 }
             }
         }
-        Ok(())
+        Ok(path.curr.clone())
     }
 
     //
     // Perform lookup in the database. Initialize path in the tree current element or reset path if no element is found or end of set is reached.
-    // As far as lookup is used by iterator which doesn't propagate error, we have to throw exception here using bail!
     //
     fn lookup(&self, op: LookupOp, path: &mut TreePath) {
         let db = self.db.read().unwrap();
         assert!(db.state == DatabaseState::Opened);
         let result = self.do_lookup(&db, op, path);
-        if !result.is_ok() {
-            panic!("Lookup failed: {:?}", result);
+        if result.is_err() {
+            path.curr = None;
         }
+        path.result = result.transpose();
     }
 
     //
@@ -1282,7 +1335,7 @@ impl Storage {
                 r = m;
             }
         }
-        assert!(l == r);
+        debug_assert!(l == r);
         path.stack.push(PagePos { pid, pos: r });
         if height == 1 {
             // leaf page
@@ -1308,10 +1361,10 @@ impl Storage {
         path: &mut TreePath,
         db: &RwLockReadGuard<Database>,
     ) -> Result<bool> {
-        if let Some((key, _value)) = path.curr.clone() {
+        if let Some((key, _value)) = &path.curr.clone() {
             if self.find(db.meta.root, path, &key, db.meta.height)? {
-                if let Some((ge_key, _value)) = path.curr.clone() {
-                    if ge_key == *key {
+                if let Some((ge_key, _value)) = &path.curr {
+                    if ge_key == key {
                         path.lsn = db.lsn;
                         return Ok(true);
                     }
@@ -1328,6 +1381,7 @@ impl Storage {
     //
     fn move_forward(&self, path: &mut TreePath, height: u32) -> Result<()> {
         let mut inc: usize = 1;
+        path.curr = None;
         while !path.stack.is_empty() {
             let top = path.stack.pop().unwrap();
             let pin = self.get_page(top.pid, AccessMode::ReadOnly)?;
@@ -1362,6 +1416,7 @@ impl Storage {
     // Move cursor backward
     //
     fn move_backward(&self, path: &mut TreePath, height: u32) -> Result<()> {
+        path.curr = None;
         while !path.stack.is_empty() {
             let top = path.stack.pop().unwrap();
             let pin = self.get_page(top.pid, AccessMode::ReadOnly)?;
@@ -1460,9 +1515,9 @@ impl Storage {
     ///
     /// Lookup particular key in the storage.
     ///
-    pub fn get(&self, key: &Key) -> Option<Value> {
+    pub fn get(&self, key: &Key) -> Result<Option<Value>> {
         let mut iter = self.range((Included(key), Included(key)));
-        iter.next().map(|kv| kv.1)
+        Ok(iter.next().transpose()?.map(|kv| kv.1))
     }
 
     ///
@@ -1475,11 +1530,13 @@ impl Storage {
             till: range.end_bound().cloned(),
             left: TreePath {
                 curr: None,
+                result: None,
                 stack: Vec::new(),
                 lsn: 0,
             },
             right: TreePath {
                 curr: None,
+                result: None,
                 stack: Vec::new(),
                 lsn: 0,
             },
@@ -1490,16 +1547,25 @@ impl Storage {
     /// Close storage. Close data and WAL files and truncate WAL file.
     ///
     pub fn close(&self) -> Result<()> {
-        let mut db = self.db.write().unwrap();
-        if db.state == DatabaseState::Opened {
-            // Sync data file and truncate log in case of normal shutdown
-            self.file.sync_all()?;
-            if let Some(log) = &self.log {
-                log.set_len(0)?; // truncate WAL
+        if let Ok(mut db) = self.db.write() {
+            if db.state == DatabaseState::Opened {
+                // Sync data file and truncate log in case of normal shutdown
+                self.file.sync_all()?;
+                if let Some(log) = &self.log {
+                    log.set_len(0)?; // truncate WAL
+                }
+                db.state = DatabaseState::Closed;
             }
-            db.state = DatabaseState::Closed;
         }
         Ok(())
+    }
+
+    ///
+    /// Get recovery status
+    ///
+    pub fn get_recovery_status(&self) -> RecoveryStatus {
+        let db = self.db.read().unwrap();
+        db.recovery
     }
 }
 

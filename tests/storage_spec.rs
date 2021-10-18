@@ -20,65 +20,78 @@ fn test_basic_ops() {
     store.put(v(b"4"), v(b"four")).unwrap();
     store.put(v(b"5"), v(b"five")).unwrap();
 
-    assert_eq!(store.get(&v(b"1")), Some(v(b"one")));
+    assert_eq!(store.get(&v(b"1")).unwrap().unwrap(), v(b"one"));
 
     let mut b = b'1';
-    for kv in store.iter() {
+    for kv in store.iter().flatten() {
         assert_eq!(kv.0, vec![b]);
         b += 1;
     }
     assert_eq!(b, b'6');
 
     assert_eq!(
-        store.range(..v(b"3")).collect::<Vec<(Key, Value)>>(),
+        store
+            .range(..v(b"3"))
+            .flatten()
+            .collect::<Vec<(Key, Value)>>(),
         [(v(b"1"), v(b"one")), (v(b"2"), v(b"two"))]
     );
     assert_eq!(
-        store.range(v(b"3")..v(b"4")).collect::<Vec<(Key, Value)>>(),
+        store
+            .range(v(b"3")..v(b"4"))
+            .flatten()
+            .collect::<Vec<(Key, Value)>>(),
         [(v(b"3"), v(b"three"))]
     );
     assert_eq!(
         store
             .range(v(b"1")..=v(b"2"))
+            .flatten()
             .collect::<Vec<(Key, Value)>>(),
         [(v(b"1"), v(b"one")), (v(b"2"), v(b"two"))]
     );
     assert_eq!(
-        store.range(v(b"5")..).collect::<Vec<(Key, Value)>>(),
+        store
+            .range(v(b"5")..)
+            .flatten()
+            .collect::<Vec<(Key, Value)>>(),
         [(v(b"5"), v(b"five"))]
     );
 
     {
         let mut it = store.iter();
-        assert_eq!(it.next(), Some((v(b"1"), v(b"one"))));
-        assert_eq!(it.next(), Some((v(b"2"), v(b"two"))));
-        assert_eq!(it.next_back(), Some((v(b"5"), v(b"five"))));
-        assert_eq!(it.next_back(), Some((v(b"4"), v(b"four"))));
+        assert_eq!(it.next().unwrap().unwrap(), (v(b"1"), v(b"one")));
+        assert_eq!(it.next().unwrap().unwrap(), (v(b"2"), v(b"two")));
+        assert_eq!(it.next_back().unwrap().unwrap(), (v(b"5"), v(b"five")));
+        assert_eq!(it.next_back().unwrap().unwrap(), (v(b"4"), v(b"four")));
     }
     {
         let mut it = store.range(..v(b"4"));
-        assert_eq!(it.next_back(), Some((v(b"3"), v(b"three"))));
-        assert_eq!(it.next_back(), Some((v(b"2"), v(b"two"))));
-        assert_eq!(it.next(), Some((v(b"1"), v(b"one"))));
-        assert_eq!(it.next(), Some((v(b"2"), v(b"two"))));
+        assert_eq!(it.next_back().unwrap().unwrap(), (v(b"3"), v(b"three")));
+        assert_eq!(it.next_back().unwrap().unwrap(), (v(b"2"), v(b"two")));
+        assert_eq!(it.next().unwrap().unwrap(), (v(b"1"), v(b"one")));
+        assert_eq!(it.next().unwrap().unwrap(), (v(b"2"), v(b"two")));
     }
     {
         let mut it = store.range(v(b"1")..=v(b"2"));
-        assert_eq!(it.next(), Some((v(b"1"), v(b"one"))));
-        assert_eq!(it.next(), Some((v(b"2"), v(b"two"))));
-        assert_eq!(it.next(), None);
-        assert_eq!(it.next_back(), Some((v(b"2"), v(b"two"))));
-        assert_eq!(it.next_back(), Some((v(b"1"), v(b"one"))));
-        assert_eq!(it.next_back(), None);
+        assert_eq!(it.next().unwrap().unwrap(), (v(b"1"), v(b"one")));
+        assert_eq!(it.next().unwrap().unwrap(), (v(b"2"), v(b"two")));
+        assert!(it.next().is_none());
+        assert_eq!(it.next_back().unwrap().unwrap(), (v(b"2"), v(b"two")));
+        assert_eq!(it.next_back().unwrap().unwrap(), (v(b"1"), v(b"one")));
+        assert!(it.next_back().is_none());
     }
     store.put(v(b"2"), v(b"two-two")).unwrap();
-    assert_eq!(store.get(&v(b"1")), Some(v(b"one")));
-    assert_eq!(store.get(&v(b"2")), Some(v(b"two-two")));
-    assert_eq!(store.get(&v(b"3")), Some(v(b"three")));
+    assert_eq!(store.get(&v(b"1")).unwrap().unwrap(), v(b"one"));
+    assert_eq!(store.get(&v(b"2")).unwrap().unwrap(), v(b"two-two"));
+    assert_eq!(store.get(&v(b"3")).unwrap().unwrap(), v(b"three"));
 
     store.remove(v(b"3")).unwrap();
     assert_eq!(
-        store.range(v(b"2")..v(b"5")).collect::<Vec<(Key, Value)>>(),
+        store
+            .range(v(b"2")..v(b"5"))
+            .flatten()
+            .collect::<Vec<(Key, Value)>>(),
         [(v(b"2"), v(b"two-two")), (v(b"4"), v(b"four"))]
     );
 }
@@ -114,7 +127,7 @@ fn seq_benchmark(
         now = Instant::now();
         for i in 1..=n_records {
             let key = (i as u64).to_be_bytes().to_vec();
-            assert_eq!(store.get(&key).unwrap(), payload1);
+            assert_eq!(store.get(&key).unwrap().unwrap(), payload1);
         }
         println!(
             "Elapsed time for {} hot lookups: {:?}",
@@ -128,7 +141,7 @@ fn seq_benchmark(
             store.put_all(
                 &mut iter::repeat_with(|| {
                     key += 1;
-                    Ok((pack(key), payload1.clone()))
+                    Ok((pack(key), payload2.clone()))
                 })
                 .take(transaction_size),
             )?;
@@ -141,16 +154,17 @@ fn seq_benchmark(
 
         for i in 1..=n_records {
             let key = (i as u64).to_be_bytes().to_vec();
-            assert_eq!(store.get(&key).unwrap(), payload2);
+            assert_eq!(store.get(&key).unwrap().unwrap(), payload2);
         }
     }
     {
         // reopen database
-        let store = open_store(db_path, log_path);
+        let store = reopen_store(db_path, log_path);
+
         let mut now = Instant::now();
         for i in 1..=n_records {
             let key = (i as u64).to_be_bytes().to_vec();
-            assert_eq!(store.get(&key).unwrap(), payload2);
+            assert_eq!(store.get(&key).unwrap().unwrap(), payload2);
         }
         println!(
             "Elapsed time for {} cold lookups: {:?}",
@@ -207,7 +221,7 @@ fn rnd_benchmark(
         rand = StdRng::seed_from_u64(RAND_SEED);
         for _ in 0..n_records {
             let key = rand.gen::<[u8; 8]>().to_vec();
-            assert_eq!(store.get(&key).unwrap(), payload1);
+            assert_eq!(store.get(&key).unwrap().unwrap(), payload1);
         }
         println!(
             "Elapsed time for {} hot lookups: {:?}",
@@ -219,7 +233,7 @@ fn rnd_benchmark(
         rand = StdRng::seed_from_u64(RAND_SEED);
         for _ in 0..n_records / transaction_size {
             store.put_all(
-                &mut iter::repeat_with(|| Ok((rand.gen::<[u8; 8]>().to_vec(), payload1.clone())))
+                &mut iter::repeat_with(|| Ok((rand.gen::<[u8; 8]>().to_vec(), payload2.clone())))
                     .take(transaction_size),
             )?;
         }
@@ -232,18 +246,18 @@ fn rnd_benchmark(
         rand = StdRng::seed_from_u64(RAND_SEED);
         for _ in 0..n_records {
             let key = rand.gen::<[u8; 8]>().to_vec();
-            assert_eq!(store.get(&key).unwrap(), payload2);
+            assert_eq!(store.get(&key).unwrap().unwrap(), payload2);
         }
     }
     {
         // reopen database
-        let store = open_store(db_path, log_path);
+        let store = reopen_store(db_path, log_path);
 
         let mut now = Instant::now();
         let mut rand = StdRng::seed_from_u64(RAND_SEED);
         for _ in 1..=n_records {
             let key = rand.gen::<[u8; 8]>().to_vec();
-            assert_eq!(store.get(&key).unwrap(), payload2);
+            assert_eq!(store.get(&key).unwrap().unwrap(), payload2);
         }
         println!(
             "Elapsed time for {} cold lookups: {:?}",
@@ -310,7 +324,7 @@ fn rnd_benchmark_nowal_small_trans() {
 
 #[test]
 fn test_acid() {
-    let store = open_store("test10.dbs", Some("test10.dbs"));
+    let store = open_store("test10.dbs", Some("test10.log"));
 
     assert!(store
         .put_all(&mut (0..100).map(|key| {
@@ -341,6 +355,7 @@ fn test_acid() {
     assert_eq!(
         store
             .iter()
+            .flatten()
             .map(|kv| assert_eq!(kv.1, v(b"hello world!")))
             .count(),
         100
@@ -371,8 +386,14 @@ fn open_store(data_file: &str, log_file: Option<&str>) -> Storage {
     let data_path = Path::new(data_file);
     let log_path = log_file.map(|wal| Path::new(wal));
     let _ = std::fs::remove_file(&data_path);
-	if let Some(log) = log_path {
-		let _ = std::fs::remove_file(&log);
-	}
+    if let Some(log) = log_path {
+        let _ = std::fs::remove_file(&log);
+    }
+    Storage::open(data_path, log_path, CACHE_SIZE, CHECKPOINT_INTERVAL).unwrap()
+}
+
+fn reopen_store(data_file: &str, log_file: Option<&str>) -> Storage {
+    let data_path = Path::new(data_file);
+    let log_path = log_file.map(|wal| Path::new(wal));
     Storage::open(data_path, log_path, CACHE_SIZE, CHECKPOINT_INTERVAL).unwrap()
 }

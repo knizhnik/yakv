@@ -12,6 +12,7 @@ readme = "README.md"
 
 [dependencies]
 crc32c = "0.6.0"
+fs2 = "0.4.3"
 
 [dev-dependencies]
 rand = "0.8.3"
