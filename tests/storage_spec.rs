@@ -10,6 +10,8 @@ use yakv::storage::*;
 const CHECKPOINT_INTERVAL: u64 = 1u64 * 1024 * 1024 * 1024;
 const CACHE_SIZE: usize = 128 * 1024; // 1Gb
 const RAND_SEED: u64 = 2021;
+const N_RECORDS_LARGE: usize = 1000000;
+const N_RECORDS_SMALL: usize = 10000;
 
 #[test]
 fn test_basic_ops() {
@@ -284,42 +286,42 @@ fn rnd_benchmark(
 
 #[test]
 fn seq_benchmark_wal_large_trans() {
-    assert!(seq_benchmark("test2.dbs", Some("test2.log"), 1024 * 1024, 1024,).is_ok());
+    assert!(seq_benchmark("test2.dbs", Some("test2.log"), N_RECORDS_LARGE, 1000,).is_ok());
 }
 
 #[test]
 fn seq_benchmark_wal_small_trans() {
-    assert!(seq_benchmark("test3.dbs", Some("test3.log"), 1024 * 1024, 1,).is_ok());
+    assert!(seq_benchmark("test3.dbs", Some("test3.log"), N_RECORDS_SMALL, 1,).is_ok());
 }
 
 #[test]
 fn seq_benchmark_nowal_large_trans() {
-    assert!(seq_benchmark("test4.dbs", None, 1024 * 1024, 1024,).is_ok());
+    assert!(seq_benchmark("test4.dbs", None, N_RECORDS_LARGE, 1000,).is_ok());
 }
 
 #[test]
 fn seq_benchmark_nowal_small_trans() {
-    assert!(seq_benchmark("test5.dbs", None, 1024 * 1024, 1,).is_ok());
+    assert!(seq_benchmark("test5.dbs", None, N_RECORDS_LARGE, 1,).is_ok());
 }
 
 #[test]
 fn rnd_benchmark_wal_large_trans() {
-    assert!(rnd_benchmark("test6.dbs", Some("test6.log"), 1024 * 1024, 1024,).is_ok());
+    assert!(rnd_benchmark("test6.dbs", Some("test6.log"), N_RECORDS_LARGE, 1000,).is_ok());
 }
 
 #[test]
 fn rnd_benchmark_wal_small_trans() {
-    assert!(rnd_benchmark("test7.dbs", Some("test7.log"), 1024 * 1024, 1,).is_ok());
+    assert!(rnd_benchmark("test7.dbs", Some("test7.log"), N_RECORDS_SMALL, 1,).is_ok());
 }
 
 #[test]
 fn rnd_benchmark_nowal_large_trans() {
-    assert!(rnd_benchmark("test8.dbs", None, 1024 * 1024, 1024,).is_ok());
+    assert!(rnd_benchmark("test8.dbs", None, N_RECORDS_LARGE, 1000,).is_ok());
 }
 
 #[test]
 fn rnd_benchmark_nowal_small_trans() {
-    assert!(rnd_benchmark("test9.dbs", None, 1024 * 1024, 1,).is_ok());
+    assert!(rnd_benchmark("test9.dbs", None, N_RECORDS_LARGE, 1,).is_ok());
 }
 
 #[test]
