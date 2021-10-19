@@ -104,3 +104,29 @@ while let Some(entry) = it.next_back() {
 // Close storage
 store.close()?;
 ```
+
+Performance comparison:
+
+Below are results (msec) of two benchamrks.
+
+SwayDB benchmark: insertion 1M records with 8 byte key and 8 byte value.
+
+| db      |  seq  |  rnd  |
+| ------- | ----- | ----- |
+| SwayDB  | 5526  | 14849 |
+| LevelDB | 1107  | 7969  |
+| yakv    |  594  | 1263  |
+
+
+LMDB benchmark: insert+read of 1M records with 4-bytes key and 100 byte value.
+
+| db        | seq-write | rnd-write | seq-read | rnd-read |
+| --------- | --------- | --------- | -------- | -------- |
+| Chronicle | 836       | 894       | 613      | 634      |
+| LevelDB   | 1962      | 2089      | 2223     | 2476     |
+| LMDB      | 144       | 896       | 108      | 634      |
+| MapDB     | 8876      | 9304      | 9676     | 9707     |
+| MVStore   | 1328      | 1675      | 7757     | 8420     |
+| RocksDB   | 1800      | 1850      | 1814     | 2067     |
+| Xodus     | 674       | 13981     | 3486     | 4978     |
+| yakv      | 1079      | 1617      | 549      | 1020     |
