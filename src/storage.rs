@@ -9,7 +9,7 @@ use std::ops::Bound::*;
 use std::ops::{Bound, RangeBounds};
 use std::os::unix::prelude::FileExt as UnixFileExt;
 use std::path::Path;
-use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
 
 type PageId = u32; // address of page in the file
 type BufferId = u32; // index of page in buffer cache
@@ -66,6 +66,26 @@ enum AccessMode {
 }
 
 ///
+/// Status of transaction
+///
+#[derive(PartialEq)]
+pub enum TransactionStatus {
+    InProgress,
+    Committed,
+    Aborted,
+}
+
+///
+/// Explicitely started transaction. Storage can be updated in autocommit mode
+/// or using explicitly started transaction.
+///
+pub struct Transaction<'a> {
+    pub status: TransactionStatus,
+    storage: &'a Storage,
+    db: RwLockWriteGuard<'a, Database>,
+}
+
+///
 /// Status of automatic database recovery after open.
 /// In case of start after normal shutdown all fields should be zero.
 ///
@@ -84,6 +104,7 @@ pub struct RecoveryStatus {
 ///
 pub struct StorageIterator<'a> {
     storage: &'a Storage,
+    trans: Option<&'a Transaction<'a>>,
     from: Bound<Key>,
     till: Bound<Key>,
     left: TreePath,
@@ -108,28 +129,38 @@ struct TreePath {
     lsn: LSN,            // LSN of last operation
 }
 
-impl<'a> Iterator for StorageIterator<'a> {
-    type Item = Result<(Key, Value)>;
+impl TreePath {
+    fn new() -> TreePath {
+        TreePath {
+            curr: None,
+            result: None,
+            stack: Vec::new(),
+            lsn: 0,
+        }
+    }
+}
 
-    fn next(&mut self) -> Option<Self::Item> {
+impl<'a> StorageIterator<'a> {
+    fn next_locked(&mut self, db: &Database) -> Option<<StorageIterator<'a> as Iterator>::Item> {
         if self.left.stack.len() == 0 {
             match &self.from {
-                Bound::Included(key) => self
-                    .storage
-                    .lookup(LookupOp::GreaterOrEqual(key), &mut self.left),
+                Bound::Included(key) => {
+                    self.storage
+                        .lookup(db, LookupOp::GreaterOrEqual(key), &mut self.left)
+                }
                 Bound::Excluded(key) => {
                     self.storage
-                        .lookup(LookupOp::GreaterOrEqual(key), &mut self.left);
+                        .lookup(db, LookupOp::GreaterOrEqual(key), &mut self.left);
                     if let Some((curr_key, _value)) = &self.left.curr {
                         if curr_key == key {
-                            self.storage.lookup(LookupOp::Next, &mut self.left);
+                            self.storage.lookup(db, LookupOp::Next, &mut self.left);
                         }
                     }
                 }
-                Bound::Unbounded => self.storage.lookup(LookupOp::First, &mut self.left),
+                Bound::Unbounded => self.storage.lookup(db, LookupOp::First, &mut self.left),
             }
         } else {
-            self.storage.lookup(LookupOp::Next, &mut self.left);
+            self.storage.lookup(db, LookupOp::Next, &mut self.left);
         }
         if let Some((curr_key, _value)) = &self.left.curr {
             match &self.till {
@@ -148,38 +179,39 @@ impl<'a> Iterator for StorageIterator<'a> {
         }
         self.left.result.take()
     }
-}
 
-impl<'a> DoubleEndedIterator for StorageIterator<'a> {
-    fn next_back(&mut self) -> Option<Self::Item> {
+    fn next_back_locked(
+        &mut self,
+        db: &Database,
+    ) -> Option<<StorageIterator<'a> as Iterator>::Item> {
         if self.right.stack.len() == 0 {
             match &self.till {
                 Bound::Included(key) => {
                     self.storage
-                        .lookup(LookupOp::GreaterOrEqual(key), &mut self.right);
+                        .lookup(db, LookupOp::GreaterOrEqual(key), &mut self.right);
                     if let Some((curr_key, _value)) = &self.right.curr {
                         if curr_key > key {
-                            self.storage.lookup(LookupOp::Prev, &mut self.right);
+                            self.storage.lookup(db, LookupOp::Prev, &mut self.right);
                         }
                     } else {
-                        self.storage.lookup(LookupOp::Last, &mut self.right);
+                        self.storage.lookup(db, LookupOp::Last, &mut self.right);
                     }
                 }
                 Bound::Excluded(key) => {
                     self.storage
-                        .lookup(LookupOp::GreaterOrEqual(key), &mut self.right);
+                        .lookup(db, LookupOp::GreaterOrEqual(key), &mut self.right);
                     if let Some((curr_key, _value)) = &self.right.curr {
                         if curr_key >= key {
-                            self.storage.lookup(LookupOp::Prev, &mut self.right);
+                            self.storage.lookup(db, LookupOp::Prev, &mut self.right);
                         }
                     } else {
-                        self.storage.lookup(LookupOp::Last, &mut self.right);
+                        self.storage.lookup(db, LookupOp::Last, &mut self.right);
                     }
                 }
-                Bound::Unbounded => self.storage.lookup(LookupOp::Last, &mut self.right),
+                Bound::Unbounded => self.storage.lookup(db, LookupOp::Last, &mut self.right),
             }
         } else {
-            self.storage.lookup(LookupOp::Prev, &mut self.right);
+            self.storage.lookup(db, LookupOp::Prev, &mut self.right);
         }
         if let Some((curr_key, _value)) = &self.right.curr {
             match &self.from {
@@ -197,6 +229,32 @@ impl<'a> DoubleEndedIterator for StorageIterator<'a> {
             }
         }
         self.right.result.take()
+    }
+}
+
+impl<'a> Iterator for StorageIterator<'a> {
+    type Item = Result<(Key, Value)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(trans) = self.trans {
+            assert!(trans.status == TransactionStatus::InProgress);
+            self.next_locked(&trans.db)
+        } else {
+            let db = self.storage.db.read().unwrap();
+            self.next_locked(&db)
+        }
+    }
+}
+
+impl<'a> DoubleEndedIterator for StorageIterator<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if let Some(trans) = self.trans {
+            assert!(trans.status == TransactionStatus::InProgress);
+            self.next_back_locked(&trans.db)
+        } else {
+            let db = self.storage.db.read().unwrap();
+            self.next_back_locked(&db)
+        }
     }
 }
 
@@ -742,6 +800,14 @@ impl Storage {
         bm.modify_buffer(buf);
     }
 
+    pub fn start_transaction(&self) -> Transaction<'_> {
+        Transaction {
+            status: TransactionStatus::InProgress,
+            storage: self,
+            db: self.db.write().unwrap(),
+        }
+    }
+
     fn commit(&self, db: &mut RwLockWriteGuard<Database>) -> Result<()> {
         let bm = self.buf_mgr.lock().unwrap();
 
@@ -1237,7 +1303,7 @@ impl Storage {
     //
     fn do_lookup(
         &self,
-        db: &RwLockReadGuard<Database>,
+        db: &Database,
         op: LookupOp,
         path: &mut TreePath,
     ) -> Result<Option<(Key, Value)>> {
@@ -1305,10 +1371,9 @@ impl Storage {
     //
     // Perform lookup in the database. Initialize path in the tree current element or reset path if no element is found or end of set is reached.
     //
-    fn lookup(&self, op: LookupOp, path: &mut TreePath) {
-        let db = self.db.read().unwrap();
+    fn lookup(&self, db: &Database, op: LookupOp, path: &mut TreePath) {
         assert!(db.state == DatabaseState::Opened);
-        let result = self.do_lookup(&db, op, path);
+        let result = self.do_lookup(db, op, path);
         if result.is_err() {
             path.curr = None;
         }
@@ -1356,11 +1421,7 @@ impl Storage {
     // If storage is updated between iterations then try to reconstruct path by locating current element.
     // Returns true is such element is found and path is successfully reconstructed, false otherwise.
     //
-    fn reconstruct_path(
-        &self,
-        path: &mut TreePath,
-        db: &RwLockReadGuard<Database>,
-    ) -> Result<bool> {
+    fn reconstruct_path(&self, path: &mut TreePath, db: &Database) -> Result<bool> {
         if let Some((key, _value)) = &path.curr.clone() {
             if self.find(db.meta.root, path, &key, db.meta.height)? {
                 if let Some((ge_key, _value)) = &path.curr {
@@ -1526,20 +1587,11 @@ impl Storage {
     pub fn range<R: RangeBounds<Key>>(&self, range: R) -> StorageIterator<'_> {
         StorageIterator {
             storage: &self,
+            trans: None,
             from: range.start_bound().cloned(),
             till: range.end_bound().cloned(),
-            left: TreePath {
-                curr: None,
-                result: None,
-                stack: Vec::new(),
-                lsn: 0,
-            },
-            right: TreePath {
-                curr: None,
-                result: None,
-                stack: Vec::new(),
-                lsn: 0,
-            },
+            left: TreePath::new(),
+            right: TreePath::new(),
         }
     }
 
@@ -1572,5 +1624,85 @@ impl Storage {
 impl Drop for Storage {
     fn drop(&mut self) {
         self.close().unwrap();
+    }
+}
+
+impl<'a> Transaction<'_> {
+    ///
+    /// Commit transaction
+    ///
+    pub fn commit(&mut self) -> Result<()> {
+        assert!(self.status == TransactionStatus::InProgress);
+        self.storage.commit(&mut self.db)?;
+        self.status = TransactionStatus::Committed;
+        Ok(())
+    }
+
+    ///
+    /// Rollback transaction undoing all changes
+    ///
+    pub fn rollback(&mut self) -> Result<()> {
+        assert!(self.status == TransactionStatus::InProgress);
+        self.storage.rollback(&mut self.db)?;
+        self.status = TransactionStatus::Aborted;
+        Ok(())
+    }
+
+    ///
+    /// Insert new key int the storage or update existed key as part of this transaction.
+    ///
+    pub fn put(&mut self, key: &Key, value: &Value) -> Result<()> {
+        assert!(self.status == TransactionStatus::InProgress);
+        self.storage.do_upsert(&mut self.db, key, value)?;
+        Ok(())
+    }
+
+    ///
+    /// Remove key from storage as part of this transaction.
+    /// Does nothing if key not exist.
+    ///
+    pub fn remove(&mut self, key: &Key) -> Result<()> {
+        assert!(self.status == TransactionStatus::InProgress);
+        self.storage.do_remove(&mut self.db, key)?;
+        Ok(())
+    }
+
+    ///
+    /// Iterator through pairs in key ascending order.
+    /// Byte-wise comparison is used, to it is up to serializer to enforce proper ordering,
+    /// for example for unsigned integer type big-endian encoding should be used.
+    ///
+    pub fn iter(&self) -> StorageIterator<'_> {
+        self.range(..)
+    }
+
+    ///
+    /// Lookup particular key in the storage.
+    ///
+    pub fn get(&self, key: &Key) -> Result<Option<Value>> {
+        let mut iter = self.range((Included(key), Included(key)));
+        Ok(iter.next().transpose()?.map(|kv| kv.1))
+    }
+
+    ///
+    /// Returns bidirectional iterator
+    ///
+    pub fn range<R: RangeBounds<Key>>(&self, range: R) -> StorageIterator<'_> {
+        StorageIterator {
+            storage: self.storage,
+            trans: Some(&self),
+            from: range.start_bound().cloned(),
+            till: range.end_bound().cloned(),
+            left: TreePath::new(),
+            right: TreePath::new(),
+        }
+    }
+}
+
+impl<'a> Drop for Transaction<'a> {
+    fn drop(&mut self) {
+        if self.status == TransactionStatus::InProgress {
+            self.storage.rollback(&mut self.db).unwrap();
+        }
     }
 }

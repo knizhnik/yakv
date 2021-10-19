@@ -3,7 +3,7 @@ using "traditional" architecture: B-Tree, buffer cache, ACID transaction, write-
 **YAKV** implements simple MURSIW (multiple-reads-single-writer) access pattern
 and is first of all oriented on embedded applications.
 
-It has minimal dependencies from other modules and contains just 1500 lines of code.
+It has minimal dependencies from other modules and contains just 1700 lines of code.
 API of storage is very simple: `put/remove` methods for updating information
 and `get/iter/range` range methods for retrieving it.
 `put` performs update or insert: it key is not present in the storage, then it is inserted
@@ -14,6 +14,11 @@ Iteration can be done using bidirectional (_double-ended_) iterator and standard
 allows to simply specify any ranges with open/inclusive/exclusive boundaries. Iterators are not atomic:
 i.e. during iteration you can see most recent committed updates of the storage. Moreover,
 if concurrent updates delete key at current iterator position, then iteration will stop before processing all results.
+
+Another way of grouping operations is explicit start of transaction.
+Transaction has exclusive access to the database and can perform both update and lookup operations.
+At the end transaction should be explicitly committed or aborted, if it was not committed before leaving the scope,
+then it is implicitly aborted.
 
 **YAKV** supports multi-threaded access to the storage. All threads can share single storage instance (you should use Arc for it).
 Storage implementation is thread safe and all methods are immutable, so you can call them concurrently from different threads.
@@ -58,6 +63,15 @@ store.put_all(
 store.remove_all(
     &mut iter::repeat_with(|| Ok(rand.gen::<[u8; 8]>().to_vec()))
        .take(TRANSACTION_SIZE),
+
+// Explicit transaction:
+{
+    let trans = store.start_transaction();
+    trans.put(&1u64.to_be_bytes().to_vec(), &PAYLOAD)?;
+    trans.put(&2u64.to_be_bytes().to_vec(), &PAYLOAD)?;
+    trans.remove(&2u64.to_be_bytes().to_vec())?;
+    trans.commit()?;
+}
 
 // Simple lookup
 let key = b"Some key".to_vec();

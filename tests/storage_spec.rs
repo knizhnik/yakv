@@ -16,12 +16,16 @@ const N_RECORDS_SMALL: usize = 10000;
 #[test]
 fn test_basic_ops() {
     let store = open_store("test1.dbs", Some("test1.log"));
-    store.put(v(b"1"), v(b"one")).unwrap();
-    store.put(v(b"2"), v(b"two")).unwrap();
-    store.put(v(b"3"), v(b"three")).unwrap();
-    store.put(v(b"4"), v(b"four")).unwrap();
-    store.put(v(b"5"), v(b"five")).unwrap();
-
+    {
+        let mut trans = store.start_transaction();
+        trans.put(&v(b"1"), &v(b"one")).unwrap();
+        trans.put(&v(b"2"), &v(b"two")).unwrap();
+        trans.put(&v(b"3"), &v(b"three")).unwrap();
+        trans.put(&v(b"4"), &v(b"four")).unwrap();
+        trans.put(&v(b"5"), &v(b"five")).unwrap();
+        assert_eq!(trans.get(&v(b"1")).unwrap().unwrap(), v(b"one"));
+        trans.commit().unwrap();
+    }
     assert_eq!(store.get(&v(b"1")).unwrap().unwrap(), v(b"one"));
 
     let mut b = b'1';
@@ -140,13 +144,12 @@ fn seq_benchmark(
         now = Instant::now();
         key = 0;
         for _ in 0..n_records / transaction_size {
-            store.put_all(
-                &mut iter::repeat_with(|| {
-                    key += 1;
-                    Ok((pack(key), payload2.clone()))
-                })
-                .take(transaction_size),
-            )?;
+			let mut trans = store.start_transaction();
+			for _ in 0..transaction_size {
+				key += 1;
+				trans.put(&pack(key), &payload2)?;
+			}
+			trans.commit()?;
         }
         println!(
             "Elapsed time for {} updates: {:?}",
@@ -234,10 +237,11 @@ fn rnd_benchmark(
         now = Instant::now();
         rand = StdRng::seed_from_u64(RAND_SEED);
         for _ in 0..n_records / transaction_size {
-            store.put_all(
-                &mut iter::repeat_with(|| Ok((rand.gen::<[u8; 8]>().to_vec(), payload2.clone())))
-                    .take(transaction_size),
-            )?;
+			let mut trans = store.start_transaction();
+			for _ in 0..transaction_size {
+				trans.put(&rand.gen::<[u8; 8]>().to_vec(), &payload2)?;
+			}
+			trans.commit()?;
         }
         println!(
             "Elapsed time for {} updates: {:?}",
