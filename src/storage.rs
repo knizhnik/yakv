@@ -1,9 +1,9 @@
+use anyhow::{ensure, Result};
 use crc32c::*;
 use fs2::FileExt;
 use std::cmp::Ordering;
 use std::convert::TryInto;
 use std::fs::{File, OpenOptions};
-use std::io::Result;
 use std::iter;
 use std::ops::Bound::*;
 use std::ops::{Bound, RangeBounds};
@@ -654,7 +654,7 @@ impl BufferManager {
     //
     // Find buffer with specified page or allocate new buffer
     //
-    fn get_buffer(&mut self, pid: PageId) -> BufferId {
+    fn get_buffer(&mut self, pid: PageId) -> Result<BufferId> {
         let hash = pid as usize % self.hash_table.len();
         let mut h = self.hash_table[hash];
         while h != 0 {
@@ -665,7 +665,7 @@ impl BufferManager {
                     self.pin(h);
                 }
                 self.pages[h as usize].access_count = access_count + 1;
-                return h;
+                return Ok(h);
             }
             h = self.pages[h as usize].collision;
         }
@@ -681,7 +681,7 @@ impl BufferManager {
             } else {
                 // Replace least recently used page
                 let victim = self.tail;
-                assert!(victim != 0);
+                ensure!(victim != 0);
                 debug_assert!(self.pages[victim as usize].access_count == 0);
                 debug_assert!((self.pages[victim as usize].state & PAGE_DIRTY) == 0);
                 self.pin(victim);
@@ -693,7 +693,7 @@ impl BufferManager {
         self.pages[h as usize].id = pid;
         self.pages[h as usize].state = PAGE_RAW;
         self.insert(h);
-        h
+        Ok(h)
     }
 }
 
@@ -724,25 +724,25 @@ impl Storage {
     //
     // Allocate new page in storage and get buffer for it
     //
-    fn new_page(&self, db: &mut RwLockWriteGuard<Database>) -> PageGuard<'_> {
+    fn new_page(&self, db: &mut RwLockWriteGuard<Database>) -> Result<PageGuard<'_>> {
         let mut bm = self.buf_mgr.lock().unwrap();
         let free = db.meta.free;
         let buf;
         if free != 0 {
-            buf = bm.get_buffer(free);
+            buf = bm.get_buffer(free)?;
             let page = self.pool[buf as usize].read().unwrap();
             db.meta.free = page.get_u32(0);
         } else {
             // extend storage
-            buf = bm.get_buffer(db.meta.size);
+            buf = bm.get_buffer(db.meta.size)?;
             db.meta.size += 1;
         }
         bm.modify_buffer(buf);
-        PageGuard {
+        Ok(PageGuard {
             buf,
             pid: bm.pages[buf as usize].id,
             storage: &self,
-        }
+        })
     }
 
     //
@@ -751,7 +751,7 @@ impl Storage {
     //
     fn get_page(&self, pid: PageId, mode: AccessMode) -> Result<PageGuard<'_>> {
         let mut bm = self.buf_mgr.lock().unwrap();
-        let buf = bm.get_buffer(pid);
+        let buf = bm.get_buffer(pid)?;
         if (bm.pages[buf as usize].state & PAGE_BUSY) != 0 {
             // Some other thread is loading buffer: just wait until it done
             bm.pages[buf as usize].state |= PAGE_WAIT;
@@ -934,7 +934,7 @@ impl Storage {
             file.try_lock_exclusive()?;
             file.read_exact_at(&mut buf, 0)?;
             let meta = Metadata::unpack(&buf);
-            assert!(meta.magic == MAGIC && meta.version == VERSION && meta.size >= 1);
+            ensure!(meta.magic == MAGIC && meta.version == VERSION && meta.size >= 1);
             (file, meta)
         } else {
             let file = OpenOptions::new()
@@ -1098,12 +1098,12 @@ impl Storage {
         db: &mut RwLockWriteGuard<Database>,
         key: &Key,
         value: &Value,
-    ) -> PageId {
-        let pin = self.new_page(db);
+    ) -> Result<PageId> {
+        let pin = self.new_page(db)?;
         let mut page = self.pool[pin.buf as usize].write().unwrap();
         page.set_n_items(0);
         page.insert_item(0, key, value);
-        pin.pid
+        Ok(pin.pid)
     }
 
     //
@@ -1115,13 +1115,13 @@ impl Storage {
         key: &Key,
         left_child: PageId,
         right_child: PageId,
-    ) -> PageId {
-        let pin = self.new_page(db);
+    ) -> Result<PageId> {
+        let pin = self.new_page(db)?;
         let mut page = self.pool[pin.buf as usize].write().unwrap();
         page.set_n_items(0);
         page.insert_item(0, key, &left_child.to_be_bytes().to_vec());
         page.insert_item(1, &vec![], &right_child.to_be_bytes().to_vec());
-        pin.pid
+        Ok(pin.pid)
     }
 
     //
@@ -1136,10 +1136,10 @@ impl Storage {
         ip: ItemPointer,
         key: &Key,
         value: &Value,
-    ) -> Option<(Key, PageId)> {
+    ) -> Result<Option<(Key, PageId)>> {
         if !page.insert_item(ip, key, value) {
             // page is full then divide page
-            let pin = self.new_page(db);
+            let pin = self.new_page(db)?;
             let mut new_page = self.pool[pin.buf as usize].write().unwrap();
             let split = page.split(&mut new_page);
             let ok = if ip > split {
@@ -1147,10 +1147,10 @@ impl Storage {
             } else {
                 new_page.insert_item(ip, key, value)
             };
-            assert!(ok);
-            Some((new_page.get_last_key(), pin.pid))
+            ensure!(ok);
+            Ok(Some((new_page.get_last_key(), pin.pid)))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -1237,7 +1237,7 @@ impl Storage {
                 // replace old value with new one: just remove old one and reinsert new key-value pair
                 page.remove_key(r);
             }
-            Ok(self.btree_insert_in_page(db, &mut page, r, key, value))
+            self.btree_insert_in_page(db, &mut page, r, key, value)
         } else {
             // recurse to next level
             debug_assert!(r < n);
@@ -1245,15 +1245,7 @@ impl Storage {
             if let Some((key, child)) = overflow {
                 // insert new page before original
                 self.modify_page(pin.buf);
-                Ok(
-                    self.btree_insert_in_page(
-                        db,
-                        &mut page,
-                        r,
-                        &key,
-                        &child.to_be_bytes().to_vec(),
-                    ),
-                )
+                self.btree_insert_in_page(db, &mut page, r, &key, &child.to_be_bytes().to_vec())
             } else {
                 Ok(None)
             }
@@ -1269,15 +1261,15 @@ impl Storage {
         key: &Key,
         value: &Value,
     ) -> Result<()> {
-        assert!(key.len() != 0 && key.len() <= MAX_KEY_LEN && value.len() <= MAX_VALUE_LEN);
+        ensure!(key.len() != 0 && key.len() <= MAX_KEY_LEN && value.len() <= MAX_VALUE_LEN);
         if db.meta.root == 0 {
-            db.meta.root = self.btree_allocate_leaf_page(db, key, value);
+            db.meta.root = self.btree_allocate_leaf_page(db, key, value)?;
             db.meta.height = 1;
         } else if let Some((key, page)) =
             self.btree_insert(db, db.meta.root, key, value, db.meta.height)?
         {
             // overflow
-            db.meta.root = self.btree_allocate_internal_page(db, &key, page, db.meta.root);
+            db.meta.root = self.btree_allocate_internal_page(db, &key, page, db.meta.root)?;
             db.meta.height += 1;
         }
         Ok(())
@@ -1307,6 +1299,7 @@ impl Storage {
         op: LookupOp,
         path: &mut TreePath,
     ) -> Result<Option<(Key, Value)>> {
+        ensure!(db.state == DatabaseState::Opened);
         match op {
             LookupOp::First => {
                 // Locate left-most element in the tree
@@ -1372,7 +1365,6 @@ impl Storage {
     // Perform lookup in the database. Initialize path in the tree current element or reset path if no element is found or end of set is reached.
     //
     fn lookup(&self, db: &Database, op: LookupOp, path: &mut TreePath) {
-        assert!(db.state == DatabaseState::Opened);
         let result = self.do_lookup(db, op, path);
         if result.is_err() {
             path.curr = None;
@@ -1521,7 +1513,7 @@ impl Storage {
         to_remove: &mut dyn Iterator<Item = Result<Key>>,
     ) -> Result<()> {
         let mut db = self.db.write().unwrap(); // prevent concurrent access to the database during update operations (MURSIW)
-        assert!(db.state == DatabaseState::Opened);
+        ensure!(db.state == DatabaseState::Opened);
         let mut result = self.do_updates(&mut db, to_upsert, to_remove);
         if result.is_ok() {
             result = self.commit(&mut db);
@@ -1674,7 +1666,7 @@ impl<'a> Transaction<'_> {
     /// Commit transaction
     ///
     pub fn commit(&mut self) -> Result<()> {
-        assert!(self.status == TransactionStatus::InProgress);
+        ensure!(self.status == TransactionStatus::InProgress);
         self.storage.commit(&mut self.db)?;
         self.status = TransactionStatus::Committed;
         Ok(())
@@ -1684,7 +1676,7 @@ impl<'a> Transaction<'_> {
     /// Rollback transaction undoing all changes
     ///
     pub fn rollback(&mut self) -> Result<()> {
-        assert!(self.status == TransactionStatus::InProgress);
+        ensure!(self.status == TransactionStatus::InProgress);
         self.storage.rollback(&mut self.db)?;
         self.status = TransactionStatus::Aborted;
         Ok(())
@@ -1694,7 +1686,7 @@ impl<'a> Transaction<'_> {
     /// Insert new key in the storage or update existed key as part of this transaction.
     ///
     pub fn put(&mut self, key: &Key, value: &Value) -> Result<()> {
-        assert!(self.status == TransactionStatus::InProgress);
+        ensure!(self.status == TransactionStatus::InProgress);
         self.storage.do_upsert(&mut self.db, key, value)?;
         Ok(())
     }
@@ -1718,7 +1710,7 @@ impl<'a> Transaction<'_> {
     /// Does nothing if key not exist.
     ///
     pub fn remove(&mut self, key: &Key) -> Result<()> {
-        assert!(self.status == TransactionStatus::InProgress);
+        ensure!(self.status == TransactionStatus::InProgress);
         self.storage.do_remove(&mut self.db, key)?;
         Ok(())
     }

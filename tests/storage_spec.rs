@@ -1,6 +1,6 @@
+use anyhow::{bail, Result};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use std::io::{Error, ErrorKind, Result};
 use std::iter;
 use std::path::Path;
 use std::time::Instant;
@@ -335,7 +335,7 @@ fn test_acid() {
     assert!(store
         .put_all(&mut (0..100).map(|key| {
             if key == 50 {
-                Err(Error::new(ErrorKind::Interrupted, "Simulate failure"))
+                bail!("Simulate failure")
             } else {
                 Ok((pack(key), v(b"hello world!")))
             }
@@ -351,7 +351,7 @@ fn test_acid() {
     assert!(store
         .put_all(&mut (0..100).map(|key| {
             if key == 50 {
-                Err(Error::new(ErrorKind::Interrupted, "Simulate failure"))
+                bail!("Simulate failure")
             } else {
                 Ok((pack(key), v(b"good bye!")))
             }
@@ -370,7 +370,7 @@ fn test_acid() {
     assert!(store
         .remove_all(&mut (0..100).map(|key| {
             if key == 50 {
-                Err(Error::new(ErrorKind::Interrupted, "simulate failure"))
+                bail!("Simulate failure")
             } else {
                 Ok(pack(key))
             }
