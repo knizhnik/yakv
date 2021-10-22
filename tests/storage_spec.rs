@@ -144,12 +144,12 @@ fn seq_benchmark(
         now = Instant::now();
         key = 0;
         for _ in 0..n_records / transaction_size {
-			let mut trans = store.start_transaction();
-			for _ in 0..transaction_size {
-				key += 1;
-				trans.put(&pack(key), &payload2)?;
-			}
-			trans.commit()?;
+            let mut trans = store.start_transaction();
+            for _ in 0..transaction_size {
+                key += 1;
+                trans.put(&pack(key), &payload2)?;
+            }
+            trans.commit()?;
         }
         println!(
             "Elapsed time for {} updates: {:?}",
@@ -237,11 +237,11 @@ fn rnd_benchmark(
         now = Instant::now();
         rand = StdRng::seed_from_u64(RAND_SEED);
         for _ in 0..n_records / transaction_size {
-			let mut trans = store.start_transaction();
-			for _ in 0..transaction_size {
-				trans.put(&rand.gen::<[u8; 8]>().to_vec(), &payload2)?;
-			}
-			trans.commit()?;
+            let mut trans = store.start_transaction();
+            for _ in 0..transaction_size {
+                trans.put(&rand.gen::<[u8; 8]>().to_vec(), &payload2)?;
+            }
+            trans.commit()?;
         }
         println!(
             "Elapsed time for {} updates: {:?}",

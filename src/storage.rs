@@ -1537,10 +1537,24 @@ impl Storage {
     }
 
     ///
-    /// Put (key,value) pair in the storage, it such key already exist, associated value is undated
+    /// Put (key,value) pair in the storage, if such key already exist, associated value is updated
     ///
     pub fn put(&self, key: Key, value: Value) -> Result<()> {
         self.update(&mut iter::once(Ok((key, value))), &mut iter::empty())
+    }
+
+    ///
+    /// Store value for u32 key
+    ///
+    pub fn put_u32(&self, key: u32, value: Value) -> Result<()> {
+        self.put(key.to_be_bytes().to_vec(), value)
+    }
+
+    ///
+    /// Store value for u64 key
+    ///
+    pub fn put_u64(&self, key: u64, value: Value) -> Result<()> {
+        self.put(key.to_be_bytes().to_vec(), value)
     }
 
     ///
@@ -1555,6 +1569,20 @@ impl Storage {
     ///
     pub fn remove(&self, key: Key) -> Result<()> {
         self.update(&mut iter::empty(), &mut iter::once(Ok(key)))
+    }
+
+    ///
+    /// Remove u32 key from the storage, do nothing if not found
+    ///
+    pub fn remove_u32(&self, key: u32) -> Result<()> {
+        self.remove(key.to_be_bytes().to_vec())
+    }
+
+    ///
+    /// Remove u64 key from the storage, do nothing if not found
+    ///
+    pub fn remove_u64(&self, key: u64) -> Result<()> {
+        self.remove(key.to_be_bytes().to_vec())
     }
 
     ///
@@ -1574,11 +1602,25 @@ impl Storage {
     }
 
     ///
-    /// Lookup particular key in the storage.
+    /// Lookup key in the storage.
     ///
     pub fn get(&self, key: &Key) -> Result<Option<Value>> {
         let mut iter = self.range((Included(key), Included(key)));
         Ok(iter.next().transpose()?.map(|kv| kv.1))
+    }
+
+    ///
+    /// Lookup u32 key in the storage.
+    ///
+    pub fn get_u32(&self, key: u32) -> Result<Option<Value>> {
+        self.get(&key.to_be_bytes().to_vec())
+    }
+
+    ///
+    /// Lookup u64 key in the storage.
+    ///
+    pub fn get_u64(&self, key: u64) -> Result<Option<Value>> {
+        self.get(&key.to_be_bytes().to_vec())
     }
 
     ///
@@ -1649,12 +1691,26 @@ impl<'a> Transaction<'_> {
     }
 
     ///
-    /// Insert new key int the storage or update existed key as part of this transaction.
+    /// Insert new key in the storage or update existed key as part of this transaction.
     ///
     pub fn put(&mut self, key: &Key, value: &Value) -> Result<()> {
         assert!(self.status == TransactionStatus::InProgress);
         self.storage.do_upsert(&mut self.db, key, value)?;
         Ok(())
+    }
+
+    ///
+    /// Store value for u32 key
+    ///
+    pub fn put_u32(&mut self, key: u32, value: &Value) -> Result<()> {
+        self.put(&key.to_be_bytes().to_vec(), value)
+    }
+
+    ///
+    /// Store value for u64 key
+    ///
+    pub fn put_u64(&mut self, key: u64, value: &Value) -> Result<()> {
+        self.put(&key.to_be_bytes().to_vec(), value)
     }
 
     ///
@@ -1668,6 +1724,20 @@ impl<'a> Transaction<'_> {
     }
 
     ///
+    /// Remove u32 key from the storage, do nothing if not found
+    ///
+    pub fn remove_u32(&mut self, key: u32) -> Result<()> {
+        self.remove(&key.to_be_bytes().to_vec())
+    }
+
+    ///
+    /// Remove u64 key from the storage, do nothing if not found
+    ///
+    pub fn remove_u64(&mut self, key: u64) -> Result<()> {
+        self.remove(&key.to_be_bytes().to_vec())
+    }
+
+    ///
     /// Iterator through pairs in key ascending order.
     /// Byte-wise comparison is used, to it is up to serializer to enforce proper ordering,
     /// for example for unsigned integer type big-endian encoding should be used.
@@ -1677,11 +1747,25 @@ impl<'a> Transaction<'_> {
     }
 
     ///
-    /// Lookup particular key in the storage.
+    /// Lookup key in the storage.
     ///
     pub fn get(&self, key: &Key) -> Result<Option<Value>> {
         let mut iter = self.range((Included(key), Included(key)));
         Ok(iter.next().transpose()?.map(|kv| kv.1))
+    }
+
+    ///
+    /// Lookup u32 key in the storage.
+    ///
+    pub fn get_u32(&self, key: u32) -> Result<Option<Value>> {
+        self.get(&key.to_be_bytes().to_vec())
+    }
+
+    ///
+    /// Lookup u64 key in the storage.
+    ///
+    pub fn get_u64(&self, key: u64) -> Result<Option<Value>> {
+        self.get(&key.to_be_bytes().to_vec())
     }
 
     ///

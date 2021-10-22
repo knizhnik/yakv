@@ -107,7 +107,7 @@ store.close()?;
 
 Performance comparison:
 
-Below are results (msec) of two benchamrks.
+Below are results (msec: smaller is better) of two benchamrks.
 
 SwayDB benchmark: insertion 1M records with 8 byte key and 8 byte value.
 
@@ -129,4 +129,5 @@ LMDB benchmark: insert+read of 1M records with 4-bytes key and 100 byte value.
 | MVStore   | 1328      | 1675      | 7757     | 8420     |
 | RocksDB   | 1800      | 1850      | 1814     | 2067     |
 | Xodus     | 674       | 13981     | 3486     | 4978     |
+| kv        | 5626      | 7546      | 742      | 1943     |
 | yakv      | 1079      | 1617      | 549      | 1020     |
