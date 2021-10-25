@@ -31,7 +31,7 @@ pub type Value = Vec<u8>;
 const PAGE_SIZE: usize = 8192;
 const MAGIC: u32 = 0xBACE2021;
 const VERSION: u32 = 1;
-const METADATA_SIZE: usize = 6 * 4;
+const METADATA_SIZE: usize = 7 * 4;
 const PAGE_HEADER_SIZE: usize = 2; // now page header contains just number of items in the page
 const MAX_VALUE_LEN: usize = PAGE_SIZE / 4; // assume that pages may fit at least 3 items
 const MAX_KEY_LEN: usize = u8::MAX as usize; // should fit in one byte
@@ -51,12 +51,18 @@ enum LookupOp<'a> {
     GreaterOrEqual(&'a Key),
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Copy, Clone, Debug)]
 enum DatabaseState {
     InRecovery,
     Opened,
     Closed,
     Corrupted,
+}
+
+impl Default for DatabaseState {
+    fn default() -> Self {
+        Self::Closed
+    }
 }
 
 #[derive(PartialEq)]
@@ -97,6 +103,31 @@ pub struct RecoveryStatus {
     pub wal_size: u64,
     /// position of last recovery transaction in WAL
     pub recovery_end: u64,
+}
+
+///
+/// Database info
+///
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DatabaseInfo {
+    /// Number of pinned pages in buffer cache
+    n_pinned_pages: usize,
+    /// Total number of pages in buffer cache
+    n_cached_pages: usize,
+    /// Heaight of B-Tree
+    tree_height: usize,
+    /// Size of database file
+    db_size: u64,
+    /// Total size of used pages
+    db_used: u64,
+    /// Current WAL size
+    log_size: u64,
+    /// number of committed transactions in this session
+    n_committed_transactions: u64,
+    /// number of aborted transactions in this session
+    n_aborted_transactions: u64,
+    /// State of the database
+    state: DatabaseState,
 }
 
 ///
@@ -203,6 +234,9 @@ impl<'a> StorageIterator<'a> {
                     if let Some((curr_key, _value)) = &self.right.curr {
                         if curr_key >= key {
                             self.storage.lookup(db, LookupOp::Prev, &mut self.right);
+                            if let Some((curr_key, _value)) = &self.right.curr {
+                                assert!(curr_key < key);
+                            }
                         }
                     } else {
                         self.storage.lookup(db, LookupOp::Last, &mut self.right);
@@ -301,6 +335,7 @@ struct Metadata {
     version: u32, // storage format version
     free: PageId, // L1 list of free pages
     size: PageId, // size of database (pages)
+    used: PageId, // numer of used database pages
     root: PageId, // B-Tree root page
     height: u32,  // height of B-Tree
 }
@@ -324,6 +359,7 @@ impl Metadata {
 struct Database {
     meta: Metadata,           // cached metadata (stored in root page)
     lsn: LSN,                 // database modification counter
+    n_aborted_txns: LSN,      // number of aborted transactions
     state: DatabaseState,     // database state
     wal_pos: u64,             // current opsition in log file
     recovery: RecoveryStatus, // status of recovery
@@ -343,10 +379,12 @@ struct BufferManager {
 
     free_pages: BufferId,  // L1-list of free pages
     dirty_pages: BufferId, // L1-list of dirty pages
-    used: BufferId,        // amount of used pages in the cache
+    used: BufferId,        // used part of page pool
+    pinned: BufferId,      // amount of pinned pages
+    cached: BufferId,      // amount of cached pages
 
     hash_table: Vec<BufferId>, // array containing indexes of collision chains
-    pages: Vec<PageHeader>,    //page data
+    pages: Vec<PageHeader>,    // page data
 }
 
 //
@@ -564,6 +602,7 @@ impl BufferManager {
         self.pages[id as usize].access_count = 0;
         self.pages[id as usize].next = self.head;
         self.pages[id as usize].prev = 0;
+        self.pinned -= 1;
         if self.head != 0 {
             self.pages[self.head as usize].prev = id;
         } else {
@@ -589,6 +628,7 @@ impl BufferManager {
         } else {
             self.pages[next].prev = self.pages[id as usize].prev;
         }
+        self.pinned += 1;
     }
 
     //
@@ -623,6 +663,7 @@ impl BufferManager {
         self.remove(id);
         self.pages[id as usize].next = self.free_pages;
         self.free_pages = id;
+        self.cached -= 1;
     }
 
     //
@@ -674,10 +715,14 @@ impl BufferManager {
         if h != 0 {
             // has some free pages
             self.free_pages = self.pages[h as usize].next;
+            self.cached += 1;
+            self.pinned += 1;
         } else {
             h = self.used;
             if (h as usize) < self.hash_table.len() {
                 self.used += 1;
+                self.cached += 1;
+                self.pinned += 1;
             } else {
                 // Replace least recently used page
                 let victim = self.tail;
@@ -737,6 +782,7 @@ impl Storage {
             buf = bm.get_buffer(db.meta.size)?;
             db.meta.size += 1;
         }
+        db.meta.used += 1;
         bm.modify_buffer(buf);
         Ok(PageGuard {
             buf,
@@ -912,6 +958,7 @@ impl Storage {
             self.file.read_exact_at(&mut page.data, 0)?;
             db.meta = Metadata::unpack(&page.data);
         }
+        db.n_aborted_txns += 1;
         Ok(())
     }
 
@@ -949,6 +996,7 @@ impl Storage {
                 version: VERSION,
                 free: 0,
                 size: 1,
+                used: 1,
                 root: 0,
                 height: 0,
             };
@@ -976,6 +1024,8 @@ impl Storage {
                 free_pages: 0,
                 dirty_pages: 0,
                 used: 1, // pinned root page
+                cached: 1,
+                pinned: 1,
                 hash_table: vec![0; cache_size],
                 pages: vec![PageHeader::new(); cache_size],
             }),
@@ -987,6 +1037,7 @@ impl Storage {
             checkpoint_interval,
             db: RwLock::new(Database {
                 lsn: 0,
+                n_aborted_txns: 0,
                 meta,
                 recovery: RecoveryStatus {
                     ..Default::default()
@@ -1199,6 +1250,7 @@ impl Storage {
             // free page
             page.set_u32(0, db.meta.free);
             db.meta.free = pid;
+            db.meta.used -= 1;
             Ok(true)
         } else {
             Ok(false)
@@ -1440,20 +1492,21 @@ impl Storage {
             let pin = self.get_page(top.pid, AccessMode::ReadOnly)?;
             let page = self.pool[pin.buf as usize].read().unwrap();
             let n_items = page.get_n_items();
-            if top.pos + inc < n_items {
+            let pos = top.pos + inc;
+            if pos < n_items {
                 path.stack.push(PagePos {
                     pid: top.pid,
-                    pos: top.pos + inc,
+                    pos: pos,
                 });
                 if path.stack.len() == height as usize {
-                    let item = page.get_item(top.pos + inc);
+                    let item = page.get_item(pos);
                     path.curr = Some(item);
                     break;
                 }
                 // We have to use this trick with `inc` variable on the way down because
                 // Rust will detect overflow if we path -1 as pos
                 path.stack.push(PagePos {
-                    pid: page.get_child(0),
+                    pid: page.get_child(pos),
                     pos: 0,
                 });
                 inc = 0;
@@ -1474,20 +1527,24 @@ impl Storage {
             let top = path.stack.pop().unwrap();
             let pin = self.get_page(top.pid, AccessMode::ReadOnly)?;
             let page = self.pool[pin.buf as usize].read().unwrap();
-            if top.pos != 0 {
+            let pos = if top.pos == usize::MAX {
+                page.get_n_items()
+            } else {
+                top.pos
+            };
+            if pos != 0 {
                 path.stack.push(PagePos {
                     pid: top.pid,
-                    pos: top.pos - 1,
+                    pos: pos - 1,
                 });
                 if path.stack.len() == height as usize {
-                    let item = page.get_item(top.pos - 1);
+                    let item = page.get_item(pos - 1);
                     path.curr = Some(item);
                     break;
                 }
-                let n_items = page.get_n_items();
                 path.stack.push(PagePos {
-                    pid: page.get_child(n_items - 1),
-                    pos: n_items,
+                    pid: page.get_child(pos - 1),
+                    pos: usize::MAX, // start from last element of the page
                 });
             }
         }
@@ -1652,6 +1709,30 @@ impl Storage {
     pub fn get_recovery_status(&self) -> RecoveryStatus {
         let db = self.db.read().unwrap();
         db.recovery
+    }
+
+    //
+    // Get database info
+    pub fn get_database_info(&self) -> DatabaseInfo {
+        let mut db_info = DatabaseInfo {
+            ..Default::default()
+        };
+        {
+            let db = self.db.read().unwrap();
+            db_info.db_size = db.meta.size as u64 * PAGE_SIZE as u64;
+            db_info.db_used = db.meta.used as u64 * PAGE_SIZE as u64;
+            db_info.tree_height = db.meta.height as usize;
+            db_info.log_size = db.wal_pos;
+            db_info.state = db.state;
+            db_info.n_committed_transactions = db.lsn;
+            db_info.n_aborted_transactions = db.n_aborted_txns;
+        }
+        {
+            let bm = self.buf_mgr.lock().unwrap();
+            db_info.n_cached_pages = bm.cached as usize;
+            db_info.n_pinned_pages = bm.pinned as usize;
+        }
+        db_info
     }
 }
 
