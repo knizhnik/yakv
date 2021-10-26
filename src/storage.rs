@@ -234,9 +234,6 @@ impl<'a> StorageIterator<'a> {
                     if let Some((curr_key, _value)) = &self.right.curr {
                         if curr_key >= key {
                             self.storage.lookup(db, LookupOp::Prev, &mut self.right);
-                            if let Some((curr_key, _value)) = &self.right.curr {
-                                assert!(curr_key < key);
-                            }
                         }
                     } else {
                         self.storage.lookup(db, LookupOp::Last, &mut self.right);
@@ -1170,6 +1167,8 @@ impl Storage {
         let pin = self.new_page(db)?;
         let mut page = self.pool[pin.buf as usize].write().unwrap();
         page.set_n_items(0);
+        debug_assert!(left_child != 0);
+        debug_assert!(right_child != 0);
         page.insert_item(0, key, &left_child.to_be_bytes().to_vec());
         page.insert_item(1, &vec![], &right_child.to_be_bytes().to_vec());
         Ok(pin.pid)
@@ -1297,6 +1296,7 @@ impl Storage {
             if let Some((key, child)) = overflow {
                 // insert new page before original
                 self.modify_page(pin.buf);
+                debug_assert!(child != 0);
                 self.btree_insert_in_page(db, &mut page, r, &key, &child.to_be_bytes().to_vec())
             } else {
                 Ok(None)
@@ -1457,6 +1457,8 @@ impl Storage {
                 Ok(false)
             }
         } else {
+            debug_assert!(r < n);
+            debug_assert!(page.get_child(r) != 0);
             self.find(page.get_child(r), path, key, height - 1)
         }
     }
@@ -1466,6 +1468,7 @@ impl Storage {
     // Returns true is such element is found and path is successfully reconstructed, false otherwise.
     //
     fn reconstruct_path(&self, path: &mut TreePath, db: &Database) -> Result<bool> {
+        path.stack.clear();
         if let Some((key, _value)) = &path.curr.clone() {
             if self.find(db.meta.root, path, &key, db.meta.height)? {
                 if let Some((ge_key, _value)) = &path.curr {
@@ -1477,7 +1480,6 @@ impl Storage {
             }
         }
         path.curr = None;
-        path.stack.clear();
         Ok(false)
     }
 
@@ -1505,6 +1507,7 @@ impl Storage {
                 }
                 // We have to use this trick with `inc` variable on the way down because
                 // Rust will detect overflow if we path -1 as pos
+                debug_assert!(page.get_child(pos) != 0);
                 path.stack.push(PagePos {
                     pid: page.get_child(pos),
                     pos: 0,

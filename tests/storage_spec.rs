@@ -1,8 +1,11 @@
 use anyhow::{bail, Result};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use std::convert::TryInto;
 use std::iter;
 use std::path::Path;
+use std::sync::Arc;
+use std::thread;
 use std::time::Instant;
 
 use yakv::storage::*;
@@ -378,6 +381,61 @@ fn test_acid() {
         .is_err());
 
     assert_eq!(store.iter().count(), 100);
+}
+
+fn do_inserts(s: Arc<Storage>, tid: u32, n_records: u32) -> Result<()> {
+    let tid_bytes = tid.to_be_bytes();
+    for id in 0..n_records {
+        let mut key: Vec<u8> = Vec::new();
+        key.extend_from_slice(&id.to_be_bytes());
+        key.extend_from_slice(&tid_bytes);
+        s.put(key, tid_bytes.to_vec())?;
+    }
+    Ok(())
+}
+
+fn do_selects(s: Arc<Storage>, n_records: usize) {
+    while s.iter().count() != n_records {}
+}
+
+#[test]
+fn test_parallel_access() {
+    let store = Arc::new(open_store("test1.dbs", None));
+    let n_writers = 10u32;
+    let n_records = 10000u32;
+    let mut threads = Vec::new();
+    for i in 0..n_writers {
+        let s = store.clone();
+        threads.push(thread::spawn(move || {
+            do_inserts(s, i, n_records).unwrap();
+        }));
+    }
+    let s = store.clone();
+    threads.push(thread::spawn(move || {
+        do_selects(s, n_records as usize * n_writers as usize);
+    }));
+    for t in threads {
+        t.join().expect("Thread crashed");
+    }
+    let mut id = 0u32;
+    let mut tid = 0u32;
+    for entry in store.iter() {
+        let pair = entry.unwrap();
+        let key = pair.0;
+        let value = pair.1;
+        let curr_id = u32::from_be_bytes(key[0..4].try_into().unwrap());
+        let curr_tid = u32::from_be_bytes(key[4..8].try_into().unwrap());
+        let curr_value = u32::from_be_bytes(value.try_into().unwrap());
+        assert_eq!(curr_id, id);
+        assert_eq!(curr_tid, tid);
+        assert_eq!(curr_value, tid);
+        tid += 1;
+        if tid == n_writers {
+            tid = 0;
+            id += 1;
+        }
+    }
+    assert_eq!(id, n_records);
 }
 
 fn v(b: &[u8]) -> Key {
