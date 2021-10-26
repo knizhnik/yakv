@@ -1553,6 +1553,27 @@ impl Storage {
         }
         Ok(())
     }
+
+    fn traverse(&self, pid: PageId, prev_key: &mut Key, height: u32) -> Result<u64> {
+        let pin = self.get_page(pid, AccessMode::ReadOnly)?;
+        let page = self.pool[pin.buf as usize].read().unwrap();
+        let n_items = page.get_n_items();
+        let mut count = 0u64;
+        if height == 1 {
+            for i in 0..n_items {
+                ensure!(page.compare_key(i, prev_key) == Ordering::Less);
+                *prev_key = page.get_key(i);
+            }
+            count += n_items as u64;
+        } else {
+            for i in 0..n_items {
+                count += self.traverse(page.get_child(i), prev_key, height - 1)?;
+                let ord = page.compare_key(i, prev_key);
+                ensure!(ord == Ordering::Less || ord == Ordering::Equal);
+            }
+        }
+        Ok(count)
+    }
 }
 
 //
@@ -1586,6 +1607,20 @@ impl Storage {
             }
         }
         result
+    }
+
+    ///
+    /// Traverse B-Tree, check B-Tree invariants and return total number of keys in B-Tree
+    ///
+    pub fn verify(&self) -> Result<u64> {
+        let db = self.db.read().unwrap();
+        ensure!(db.state == DatabaseState::Opened);
+        if db.meta.root != 0 {
+            let mut prev_key = Vec::new();
+            self.traverse(db.meta.root, &mut prev_key, db.meta.height)
+        } else {
+            Ok(0)
+        }
     }
 
     ///
@@ -1714,8 +1749,9 @@ impl Storage {
         db.recovery
     }
 
-    //
-    // Get database info
+    ///
+    /// Get database info
+    ///
     pub fn get_database_info(&self) -> DatabaseInfo {
         let mut db_info = DatabaseInfo {
             ..Default::default()
@@ -1856,6 +1892,43 @@ impl<'a> Transaction<'_> {
             left: TreePath::new(),
             right: TreePath::new(),
         }
+    }
+    ///
+    /// Traverse B-Tree, check B-Tree invariants and return total number of keys in B-Tree
+    ///
+    pub fn verify(&self) -> Result<u64> {
+        ensure!(self.status == TransactionStatus::InProgress);
+        if self.db.meta.root != 0 {
+            let mut prev_key = Vec::new();
+            self.storage
+                .traverse(self.db.meta.root, &mut prev_key, self.db.meta.height)
+        } else {
+            Ok(0)
+        }
+    }
+
+    ///
+    /// Get database info
+    ///
+    pub fn get_database_info(&self) -> DatabaseInfo {
+        let mut db_info = DatabaseInfo {
+            ..Default::default()
+        };
+        {
+            db_info.db_size = self.db.meta.size as u64 * PAGE_SIZE as u64;
+            db_info.db_used = self.db.meta.used as u64 * PAGE_SIZE as u64;
+            db_info.tree_height = self.db.meta.height as usize;
+            db_info.log_size = self.db.wal_pos;
+            db_info.state = self.db.state;
+            db_info.n_committed_transactions = self.db.lsn;
+            db_info.n_aborted_transactions = self.db.n_aborted_txns;
+        }
+        {
+            let bm = self.storage.buf_mgr.lock().unwrap();
+            db_info.n_cached_pages = bm.cached as usize;
+            db_info.n_pinned_pages = bm.pinned as usize;
+        }
+        db_info
     }
 }
 
