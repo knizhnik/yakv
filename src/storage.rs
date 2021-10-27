@@ -52,17 +52,11 @@ enum LookupOp<'a> {
 }
 
 #[derive(PartialEq, Copy, Clone, Debug)]
-enum DatabaseState {
+pub enum DatabaseState {
     InRecovery,
     Opened,
     Closed,
     Corrupted,
-}
-
-impl Default for DatabaseState {
-    fn default() -> Self {
-        Self::Closed
-    }
 }
 
 #[derive(PartialEq)]
@@ -108,26 +102,33 @@ pub struct RecoveryStatus {
 ///
 /// Database info
 ///
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct DatabaseInfo {
-    /// Number of pinned pages in buffer cache
-    n_pinned_pages: usize,
-    /// Total number of pages in buffer cache
-    n_cached_pages: usize,
     /// Heaight of B-Tree
-    tree_height: usize,
+    pub tree_height: usize,
     /// Size of database file
-    db_size: u64,
+    pub db_size: u64,
     /// Total size of used pages
-    db_used: u64,
+    pub db_used: u64,
     /// Current WAL size
-    log_size: u64,
+    pub log_size: u64,
     /// number of committed transactions in this session
-    n_committed_transactions: u64,
+    pub n_committed_transactions: u64,
     /// number of aborted transactions in this session
-    n_aborted_transactions: u64,
+    pub n_aborted_transactions: u64,
     /// State of the database
-    state: DatabaseState,
+    pub state: DatabaseState,
+}
+
+///
+/// Buffer cache info
+///
+#[derive(Clone, Copy, Debug)]
+pub struct CacheInfo {
+    /// Number of pinned pages in buffer cache
+    pub pinned: usize,
+    /// Total number of pages in buffer cache
+    pub used: usize,
 }
 
 ///
@@ -355,11 +356,26 @@ impl Metadata {
 //
 struct Database {
     meta: Metadata,           // cached metadata (stored in root page)
+    meta_updated: bool,       // whether metadata was updated
     lsn: LSN,                 // database modification counter
     n_aborted_txns: LSN,      // number of aborted transactions
     state: DatabaseState,     // database state
     wal_pos: u64,             // current opsition in log file
     recovery: RecoveryStatus, // status of recovery
+}
+
+impl Database {
+    fn get_info(&self) -> DatabaseInfo {
+        DatabaseInfo {
+            db_size: self.meta.size as u64 * PAGE_SIZE as u64,
+            db_used: self.meta.used as u64 * PAGE_SIZE as u64,
+            tree_height: self.meta.height as usize,
+            log_size: self.wal_pos,
+            state: self.state,
+            n_committed_transactions: self.lsn,
+            n_aborted_transactions: self.n_aborted_txns,
+        }
+    }
 }
 
 //
@@ -780,6 +796,7 @@ impl Storage {
             db.meta.size += 1;
         }
         db.meta.used += 1;
+        db.meta_updated = true;
         bm.modify_buffer(buf);
         Ok(PageGuard {
             buf,
@@ -854,6 +871,11 @@ impl Storage {
     fn commit(&self, db: &mut RwLockWriteGuard<Database>) -> Result<()> {
         let bm = self.buf_mgr.lock().unwrap();
 
+        if db.meta_updated {
+            let meta = db.meta.pack();
+            let mut page = self.pool[0].write().unwrap();
+            page.data[0..METADATA_SIZE].copy_from_slice(&meta);
+        }
         if let Some(log) = &self.log {
             // Write dirty pages to log file
             let mut dirty = bm.dirty_pages;
@@ -871,12 +893,10 @@ impl Storage {
             }
             if bm.dirty_pages != 0 {
                 let mut buf = [0u8; METADATA_SIZE + 8];
-                let meta = db.meta.pack();
                 {
-                    let mut page = self.pool[0].write().unwrap();
-                    page.data[0..METADATA_SIZE].copy_from_slice(&meta);
+                    let page = self.pool[0].read().unwrap();
+                    buf[4..4 + METADATA_SIZE].copy_from_slice(&page.data[0..METADATA_SIZE]);
                 }
-                buf[4..4 + METADATA_SIZE].copy_from_slice(&meta);
                 crc = crc32c_append(crc, &buf[..4 + METADATA_SIZE]);
                 buf[4 + METADATA_SIZE..].copy_from_slice(&crc.to_be_bytes());
                 log.write_all_at(&buf, db.wal_pos)?;
@@ -885,7 +905,7 @@ impl Storage {
                 db.lsn += 1;
 
                 // Write pages to the data file
-                self.flush_buffers(bm)?;
+                self.flush_buffers(bm, db.meta_updated)?;
 
                 if db.wal_pos >= self.checkpoint_interval {
                     // Sync data file and restart from the beginning of WAL.
@@ -896,21 +916,24 @@ impl Storage {
             }
         } else {
             // No WAL mode: just write dirty pages to the disk
-            if self.flush_buffers(bm)? {
-                let meta = db.meta.pack();
-                let mut page = self.pool[0].write().unwrap();
-                page.data[0..METADATA_SIZE].copy_from_slice(&meta);
+            if self.flush_buffers(bm, db.meta_updated)? {
                 db.lsn += 1;
             }
         }
+        db.meta_updated = false;
         Ok(())
     }
 
     //
     // Flush dirty pages to the disk. Return true if database is changed.
     //
-    fn flush_buffers(&self, mut bm: MutexGuard<BufferManager>) -> Result<bool> {
+    fn flush_buffers(&self, mut bm: MutexGuard<BufferManager>, save_meta: bool) -> Result<bool> {
         let mut dirty = bm.dirty_pages;
+        if save_meta {
+            assert!(dirty != 0); // if we changed meta, then we should change or create at least one page
+            let page = self.pool[0].read().unwrap();
+            self.file.write_all_at(&page.data, 0)?;
+        }
         while dirty != 0 {
             let pid = bm.pages[dirty as usize].id;
             let file_offs = pid as u64 * PAGE_SIZE as u64;
@@ -923,10 +946,7 @@ impl Storage {
             dirty = next;
         }
         if bm.dirty_pages != 0 {
-            // Save metadata page
             bm.dirty_pages = 0;
-            let page = self.pool[0].read().unwrap();
-            self.file.write_all_at(&page.data, 0)?;
             Ok(true)
         } else {
             Ok(false)
@@ -948,12 +968,13 @@ impl Storage {
             bm.throw_buffer(dirty);
             dirty = next;
         }
-        if bm.dirty_pages != 0 {
+        bm.dirty_pages = 0;
+        if db.meta_updated {
             // reread metadata from disk
-            bm.dirty_pages = 0;
             let mut page = self.pool[0].write().unwrap();
             self.file.read_exact_at(&mut page.data, 0)?;
             db.meta = Metadata::unpack(&page.data);
+            db.meta_updated = false;
         }
         db.n_aborted_txns += 1;
         Ok(())
@@ -1036,6 +1057,7 @@ impl Storage {
                 lsn: 0,
                 n_aborted_txns: 0,
                 meta,
+                meta_updated: false,
                 recovery: RecoveryStatus {
                     ..Default::default()
                 },
@@ -1095,9 +1117,11 @@ impl Storage {
                     {
                         let mut page = self.pool[0].write().unwrap();
                         page.data[0..METADATA_SIZE].copy_from_slice(&meta_buf);
+                        db.meta_updated = true;
                     }
                     let bm = self.buf_mgr.lock().unwrap();
-                    self.flush_buffers(bm)?;
+                    self.flush_buffers(bm, true)?;
+                    db.meta_updated = false;
                     db.recovery.recovered_transactions += 1;
                     db.recovery.recovery_end = wal_pos;
                 }
@@ -1250,6 +1274,7 @@ impl Storage {
             page.set_u32(0, db.meta.free);
             db.meta.free = pid;
             db.meta.used -= 1;
+            db.meta_updated = true;
             Ok(true)
         } else {
             Ok(false)
@@ -1317,12 +1342,14 @@ impl Storage {
         if db.meta.root == 0 {
             db.meta.root = self.btree_allocate_leaf_page(db, key, value)?;
             db.meta.height = 1;
+            db.meta_updated = true;
         } else if let Some((key, page)) =
             self.btree_insert(db, db.meta.root, key, value, db.meta.height)?
         {
             // overflow
             db.meta.root = self.btree_allocate_internal_page(db, &key, page, db.meta.root)?;
             db.meta.height += 1;
+            db.meta_updated = true;
         }
         Ok(())
     }
@@ -1336,6 +1363,7 @@ impl Storage {
             if underflow {
                 db.meta.height = 0;
                 db.meta.root = 0;
+                db.meta_updated = true;
             }
         }
         Ok(())
@@ -1729,7 +1757,18 @@ impl Storage {
     ///
     pub fn close(&self) -> Result<()> {
         if let Ok(mut db) = self.db.write() {
+            // avoid poisoned lock
             if db.state == DatabaseState::Opened {
+                let mut delayed_commit = false;
+                if let Ok(bm) = self.buf_mgr.lock() {
+                    // avoid poisoned mutex
+                    if bm.dirty_pages != 0 {
+                        delayed_commit = true;
+                    }
+                }
+                if delayed_commit {
+                    self.commit(&mut db)?;
+                }
                 // Sync data file and truncate log in case of normal shutdown
                 self.file.sync_all()?;
                 if let Some(log) = &self.log {
@@ -1753,25 +1792,19 @@ impl Storage {
     /// Get database info
     ///
     pub fn get_database_info(&self) -> DatabaseInfo {
-        let mut db_info = DatabaseInfo {
-            ..Default::default()
-        };
-        {
-            let db = self.db.read().unwrap();
-            db_info.db_size = db.meta.size as u64 * PAGE_SIZE as u64;
-            db_info.db_used = db.meta.used as u64 * PAGE_SIZE as u64;
-            db_info.tree_height = db.meta.height as usize;
-            db_info.log_size = db.wal_pos;
-            db_info.state = db.state;
-            db_info.n_committed_transactions = db.lsn;
-            db_info.n_aborted_transactions = db.n_aborted_txns;
+        let db = self.db.read().unwrap();
+        db.get_info()
+    }
+
+    ///
+    /// Get cache info
+    ///
+    pub fn get_cache_info(&self) -> CacheInfo {
+        let bm = self.buf_mgr.lock().unwrap();
+        CacheInfo {
+            used: bm.cached as usize,
+            pinned: bm.pinned as usize,
         }
-        {
-            let bm = self.buf_mgr.lock().unwrap();
-            db_info.n_cached_pages = bm.cached as usize;
-            db_info.n_pinned_pages = bm.pinned as usize;
-        }
-        db_info
     }
 }
 
@@ -1788,6 +1821,17 @@ impl<'a> Transaction<'_> {
     pub fn commit(&mut self) -> Result<()> {
         ensure!(self.status == TransactionStatus::InProgress);
         self.storage.commit(&mut self.db)?;
+        self.status = TransactionStatus::Committed;
+        Ok(())
+    }
+
+    ///
+    /// Delay commit of transaction
+    ///
+    pub fn delay(&mut self) -> Result<()> {
+        ensure!(self.status == TransactionStatus::InProgress);
+        self.db.lsn += 1;
+        // mark transaction as committed to prevent implicit rollback by destructor
         self.status = TransactionStatus::Committed;
         Ok(())
     }
@@ -1911,24 +1955,14 @@ impl<'a> Transaction<'_> {
     /// Get database info
     ///
     pub fn get_database_info(&self) -> DatabaseInfo {
-        let mut db_info = DatabaseInfo {
-            ..Default::default()
-        };
-        {
-            db_info.db_size = self.db.meta.size as u64 * PAGE_SIZE as u64;
-            db_info.db_used = self.db.meta.used as u64 * PAGE_SIZE as u64;
-            db_info.tree_height = self.db.meta.height as usize;
-            db_info.log_size = self.db.wal_pos;
-            db_info.state = self.db.state;
-            db_info.n_committed_transactions = self.db.lsn;
-            db_info.n_aborted_transactions = self.db.n_aborted_txns;
-        }
-        {
-            let bm = self.storage.buf_mgr.lock().unwrap();
-            db_info.n_cached_pages = bm.cached as usize;
-            db_info.n_pinned_pages = bm.pinned as usize;
-        }
-        db_info
+        self.db.get_info()
+    }
+
+    ///
+    /// Get cache info
+    ///
+    pub fn get_cache_info(&self) -> CacheInfo {
+        self.storage.get_cache_info()
     }
 }
 
