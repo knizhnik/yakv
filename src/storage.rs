@@ -1487,7 +1487,10 @@ impl Storage {
         } else {
             debug_assert!(r < n);
             debug_assert!(page.get_child(r) != 0);
-            self.find(page.get_child(r), path, key, height - 1)
+            while r < n && !self.find(page.get_child(r), path, key, height - 1)? {
+                r += 1;
+            }
+            Ok(r < n)
         }
     }
 
