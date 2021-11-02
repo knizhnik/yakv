@@ -794,13 +794,13 @@ impl Storage {
                     .read_exact_at(&mut page.data, free as u64 * PAGE_SIZE as u64)?;
             }
             db.meta.free = page.get_u32(0);
-			page.data.fill(0u8);
+            page.data.fill(0u8);
         } else {
             // extend storage
             buf = bm.get_buffer(db.meta.size)?;
             db.meta.size += 1;
             let mut page = self.pool[buf as usize].write().unwrap();
-			page.data.fill(0u8);
+            page.data.fill(0u8);
         }
         db.meta.used += 1;
         db.meta_updated = true;
