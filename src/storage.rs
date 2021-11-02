@@ -783,21 +783,29 @@ impl Storage {
     // Allocate new page in storage and get buffer for it
     //
     fn new_page(&self, db: &mut RwLockWriteGuard<Database>) -> Result<PageGuard<'_>> {
-        let mut bm = self.buf_mgr.lock().unwrap();
         let free = db.meta.free;
         let buf;
+        let mut bm = self.buf_mgr.lock().unwrap();
         if free != 0 {
             buf = bm.get_buffer(free)?;
-            let page = self.pool[buf as usize].read().unwrap();
+            let mut page = self.pool[buf as usize].write().unwrap();
+            if (bm.pages[buf as usize].state & PAGE_RAW) != 0 {
+                self.file
+                    .read_exact_at(&mut page.data, free as u64 * PAGE_SIZE as u64)?;
+            }
             db.meta.free = page.get_u32(0);
+			page.data.fill(0u8);
         } else {
             // extend storage
             buf = bm.get_buffer(db.meta.size)?;
             db.meta.size += 1;
+            let mut page = self.pool[buf as usize].write().unwrap();
+			page.data.fill(0u8);
         }
         db.meta.used += 1;
         db.meta_updated = true;
         bm.modify_buffer(buf);
+
         Ok(PageGuard {
             buf,
             pid: bm.pages[buf as usize].id,
@@ -825,20 +833,20 @@ impl Storage {
                 }
             }
         } else if (bm.pages[buf as usize].state & PAGE_RAW) != 0 {
-            let mut page = self.pool[buf as usize].write().unwrap();
             if mode != AccessMode::WriteOnly {
                 // Read buffer if not in write-only mode
                 bm.pages[buf as usize].state = PAGE_BUSY;
                 drop(bm); // read page without holding lock
-                self.file
-                    .read_exact_at(&mut page.data, pid as u64 * PAGE_SIZE as u64)?;
+                {
+                    let mut page = self.pool[buf as usize].write().unwrap();
+                    self.file
+                        .read_exact_at(&mut page.data, pid as u64 * PAGE_SIZE as u64)?;
+                }
                 bm = self.buf_mgr.lock().unwrap();
                 if (bm.pages[buf as usize].state & PAGE_WAIT) != 0 {
                     // Somebody is waiting for us
                     self.busy_events[buf as usize % N_BUSY_EVENTS].notify_all();
                 }
-            } else {
-                page.data.fill(0u8); // memset
             }
             bm.pages[buf as usize].state = 0;
         }
@@ -959,7 +967,6 @@ impl Storage {
     fn rollback(&self, db: &mut RwLockWriteGuard<Database>) -> Result<()> {
         let mut bm = self.buf_mgr.lock().unwrap();
         let mut dirty = bm.dirty_pages;
-
         // Just throw away all dirty pages from buffer cache to force reloading of original pages
         while dirty != 0 {
             debug_assert!((bm.pages[dirty as usize].state & PAGE_DIRTY) != 0);
@@ -969,6 +976,7 @@ impl Storage {
             dirty = next;
         }
         bm.dirty_pages = 0;
+
         if db.meta_updated {
             // reread metadata from disk
             let mut page = self.pool[0].write().unwrap();
@@ -1481,16 +1489,25 @@ impl Storage {
                 Ok(true)
             } else {
                 path.curr = None;
-                path.stack.clear();
+                path.stack.pop();
                 Ok(false)
             }
         } else {
             debug_assert!(r < n);
-            debug_assert!(page.get_child(r) != 0);
-            while r < n && !self.find(page.get_child(r), path, key, height - 1)? {
+            loop {
+                debug_assert!(page.get_child(r) != 0);
+                if self.find(page.get_child(r), path, key, height - 1)? {
+                    return Ok(true);
+                }
+                path.stack.pop();
                 r += 1;
+                if r < n {
+                    path.stack.push(PagePos { pid, pos: r });
+                } else {
+                    break;
+                }
             }
-            Ok(r < n)
+            Ok(false)
         }
     }
 
