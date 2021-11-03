@@ -510,7 +510,7 @@ impl PageData {
         }
     }
 
-    fn remove_key(&mut self, ip: ItemPointer) {
+    fn remove_key(&mut self, ip: ItemPointer, leaf: bool) {
         let n_items = self.get_n_items();
         let size = self.get_size();
         let (item_offs, item_len) = self.get_item_offs_len(ip);
@@ -518,12 +518,15 @@ impl PageData {
             self.set_offs(i - 1, self.get_offs(i) + item_len);
         }
         let items_origin = PAGE_SIZE - size;
-        if n_items > 1 && ip + 1 == n_items && self.data[item_offs] == 0 {
-            // If we are removing last child of internal page with +inf key,
-            // then we should replace key of previous item with +inf
-            let prev_key_len = self.data[item_offs + item_len] as usize;
-            self.set_offs(ip - 1, item_offs + item_len + prev_key_len);
-            self.data[item_offs + item_len + prev_key_len] = 0u8; // zero length means +inf
+        if !leaf && n_items > 1 && ip + 1 == n_items {
+            // If we are removing last child of internal page then copy it's key to the previous item
+			let prev_item_offs = item_offs + item_len;
+            let key_len = self.data[item_offs] as usize;
+            let prev_key_len = self.data[prev_item_offs] as usize;
+			let new_offs = prev_item_offs + prev_key_len - key_len;
+            self.set_offs(ip - 1, new_offs);
+			self.data
+                .copy_within(item_offs..item_offs + prev_key_len + 1, new_offs);
         } else {
             self.data
                 .copy_within(items_origin..item_offs, items_origin + item_len);
@@ -1266,7 +1269,7 @@ impl Storage {
             // leaf page
             if r < n && page.compare_key(r, key) == Ordering::Equal {
                 self.modify_page(pin.buf);
-                page.remove_key(r);
+                page.remove_key(r, true);
             }
         } else {
             // recurse to next level
@@ -1274,7 +1277,7 @@ impl Storage {
             let underflow = self.btree_remove(db, page.get_child(r), key, height - 1)?;
             if underflow {
                 self.modify_page(pin.buf);
-                page.remove_key(r);
+                page.remove_key(r, false);
             }
         }
         if page.get_n_items() == 0 {
@@ -1319,7 +1322,7 @@ impl Storage {
             self.modify_page(pin.buf);
             if r < n && page.compare_key(r, key) == Ordering::Equal {
                 // replace old value with new one: just remove old one and reinsert new key-value pair
-                page.remove_key(r);
+                page.remove_key(r, true);
             }
             self.btree_insert_in_page(db, &mut page, r, key, value)
         } else {
