@@ -520,12 +520,12 @@ impl PageData {
         let items_origin = PAGE_SIZE - size;
         if !leaf && n_items > 1 && ip + 1 == n_items {
             // If we are removing last child of internal page then copy it's key to the previous item
-			let prev_item_offs = item_offs + item_len;
+            let prev_item_offs = item_offs + item_len;
             let key_len = self.data[item_offs] as usize;
             let prev_key_len = self.data[prev_item_offs] as usize;
-			let new_offs = prev_item_offs + prev_key_len - key_len;
+            let new_offs = prev_item_offs + prev_key_len - key_len;
             self.set_offs(ip - 1, new_offs);
-			self.data
+            self.data
                 .copy_within(item_offs..item_offs + prev_key_len + 1, new_offs);
         } else {
             self.data
