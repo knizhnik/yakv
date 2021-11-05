@@ -10,8 +10,6 @@ use std::time::Instant;
 
 use yakv::storage::*;
 
-const CHECKPOINT_INTERVAL: u64 = 1u64 * 1024 * 1024 * 1024;
-const CACHE_SIZE: usize = 128 * 1024; // 1Gb
 const RAND_SEED: u64 = 2021;
 const N_RECORDS_LARGE: usize = 1000000;
 const N_RECORDS_SMALL: usize = 10000;
@@ -453,11 +451,11 @@ fn open_store(data_file: &str, log_file: Option<&str>) -> Storage {
     if let Some(log) = log_path {
         let _ = std::fs::remove_file(&log);
     }
-    Storage::open(data_path, log_path, CACHE_SIZE, CHECKPOINT_INTERVAL).unwrap()
+    Storage::open(data_path, log_path, StorageConfig::default()).unwrap()
 }
 
 fn reopen_store(data_file: &str, log_file: Option<&str>) -> Storage {
     let data_path = Path::new(data_file);
     let log_path = log_file.map(|wal| Path::new(wal));
-    Storage::open(data_path, log_path, CACHE_SIZE, CHECKPOINT_INTERVAL).unwrap()
+    Storage::open(data_path, log_path, StorageConfig::default()).unwrap()
 }

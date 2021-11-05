@@ -3,7 +3,7 @@ using "traditional" architecture: B-Tree, buffer cache, ACID transaction, write-
 **YAKV** implements simple MURSIW (multiple-reads-single-writer) access pattern
 and is first of all oriented on embedded applications.
 
-It has minimal dependencies from other modules and contains just 1700 lines of code.
+It has minimal dependencies from other modules and contains just 2k lines of code.
 API of storage is very simple: `put/remove` methods for updating information
 and `get/iter/range` range methods for retrieving it.
 `put` performs update or insert: it key is not present in the storage, then it is inserted
@@ -40,7 +40,7 @@ To disable WAL just pass `None` instead of WAL file path.
 Below is an example of **YAKV** usage":
 
 ```
-let store = Storage::open(data_path, Some(log_path), CACHE_SIZE, CHECKPOINT_INTERVAL)?;
+let store = Storage::open(data_path, Some(log_path), StorageConfig::default())?;
 
 // Simple insert/update:
 let key = b"Some key".to_vec();
