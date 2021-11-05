@@ -10,6 +10,8 @@ use std::ops::{Bound, RangeBounds};
 use std::os::unix::prelude::FileExt as UnixFileExt;
 use std::path::Path;
 use std::sync::{Condvar, Mutex, RwLock, RwLockWriteGuard};
+use std::time::Instant;
+use tracing::*;
 
 type PageId = u32; // address of page in the file
 type BufferId = u32; // index of page in buffer cache
@@ -391,6 +393,9 @@ struct Database {
     tx_crc: u32,              // accumulated CRC of the current transaction
     tx_size: usize,           // current transaction size
     recovery: RecoveryStatus, // status of recovery
+    flushed_before_commit: usize,
+    flushed_by_commit: usize,
+    redundant_writes: usize,
 }
 
 impl Database {
@@ -958,8 +963,12 @@ impl Storage {
         bm: &mut BufferManager,
         buf: BufferId,
     ) -> Result<()> {
+        if (bm.pages[buf as usize].state & PAGE_SYNCED) != 0 {
+            db.redundant_writes += 1;
+        }
         if let Some((sync_buf, sync_pid)) = bm.modify_buffer(buf, self.conf.wal_flush_threshold)? {
             assert_eq!(bm.pages[sync_buf as usize].state, PAGE_DIRTY | PAGE_SYNCED);
+            db.flushed_before_commit += 1;
             self.write_page_to_wal(db, sync_buf, sync_pid)?;
         }
         Ok(())
@@ -998,6 +1007,7 @@ impl Storage {
     fn commit(&self, db: &mut Database) -> Result<()> {
         let mut bm = self.buf_mgr.lock().unwrap();
 
+        let now = Instant::now();
         if db.meta_updated {
             let meta = db.meta.pack();
             let mut page = self.pool[0].write().unwrap();
@@ -1010,6 +1020,7 @@ impl Storage {
                 assert_eq!(bm.pages[dirty as usize].state, PAGE_DIRTY);
                 self.write_page_to_wal(db, dirty, bm.pages[dirty as usize].pid)?;
                 dirty = bm.pages[dirty as usize].next;
+                db.flushed_by_commit += 1;
             }
             if bm.dirty_pages != 0 {
                 let mut buf = [0u8; METADATA_SIZE + 8];
@@ -1021,7 +1032,9 @@ impl Storage {
                 buf[4 + METADATA_SIZE..].copy_from_slice(&crc.to_be_bytes());
                 log.write_all_at(&buf, db.wal_pos)?;
                 db.wal_pos += (8 + METADATA_SIZE) as u64;
+                let now = Instant::now();
                 log.sync_all()?;
+                info!("log.sync_all: {:?}", now.elapsed());
                 db.lsn += 1;
                 db.tx_crc = 0;
                 db.tx_size = 0;
@@ -1032,7 +1045,9 @@ impl Storage {
                 if db.wal_pos >= self.conf.checkpoint_interval {
                     // Sync data file and restart from the beginning of WAL.
                     // So not truncate WAL to avoid file extension overhead.
+                    let now = Instant::now();
                     self.file.sync_all()?;
+                    info!("file.sync_all: {:?}", now.elapsed());
                     db.wal_pos = 0;
                 }
             }
@@ -1043,6 +1058,7 @@ impl Storage {
             }
         }
         db.meta_updated = false;
+        info!("Commit time {:?}, flushed before commit {} flushed during commit {}, redundant writes {}", now.elapsed(), db.flushed_before_commit, db.flushed_by_commit, db.redundant_writes);
         Ok(())
     }
 
@@ -1153,6 +1169,16 @@ impl Storage {
                 .create(true)
                 .open(path)?;
             log.try_lock_exclusive()?;
+            let log_dup = log.try_clone()?;
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                log_dup.sync_all().unwrap();
+            });
+            let file_dup = file.try_clone()?;
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                file_dup.sync_all().unwrap();
+            });
             Some(log)
         } else {
             None
@@ -1190,6 +1216,9 @@ impl Storage {
                 wal_pos: 0,
                 tx_crc: 0,
                 tx_size: 0,
+                flushed_before_commit: 0,
+                flushed_by_commit: 0,
+                redundant_writes: 0,
             }),
         };
         storage.recovery()?;
