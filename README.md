@@ -131,3 +131,20 @@ LMDB benchmark: insert+read of 1M records with 4-bytes key and 100 byte value.
 | Xodus     | 674       | 13981     | 3486     | 4978     |
 | kv        | 5626      | 7546      | 742      | 1943     |
 | yakv      | 1079      | 1617      | 549      | 1020     |
+
+
+Performance dependency on transaction size (LMDB vs. YAKV or COW vs. WAL).
+This benchmark inserts 1M random keys (as in LMDB benchmark),
+but inserts are grouped in transactions (time in msec):
+
+| tx size |  yakv  |  LMDB  |
+| ------- | ------ | ------ |
+| 1000000 |   1543 |   1367 |
+| 100000  |   3914 |   3022 |
+| 10000   |  16384 |   8139 |
+| 1000    |  30944 |  16881 |
+| 100     |  85268 |  70775 |
+| 10      | 192179 | 229538 |
+
+So for large transactions LMDB is slightly faster, for small transactions YAKV is faster
+and for medium size transactions LMDB is about two times faster than YAKV.
