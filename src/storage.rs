@@ -603,22 +603,30 @@ impl PageData {
     // largest - left on original page.
     // Returns split position
     //
-    fn split(&mut self, new_page: &mut PageData) -> ItemPointer {
+    fn split(&mut self, new_page: &mut PageData, ip: ItemPointer) -> ItemPointer {
         let n_items = self.get_n_items();
         let size = self.get_size();
-        let margin = PAGE_SIZE - size / 2;
-        let mut l: ItemPointer = 0;
         let mut r = n_items;
-        while l < r {
-            let m = (l + r) >> 1;
-            if self.get_offs(m) > margin {
-                // items are allocated from right to left
-                l = m + 1;
-            } else {
-                r = m;
+
+        if ip == r {
+            // Optimization for insert of sequential keys: move all data to new page,
+            // leaving original page empty. It will cause complete filling of B-Tree pages.
+            r -= 1;
+        } else {
+            // Divide page in two approximately equal parts.
+            let margin = PAGE_SIZE - size / 2;
+            let mut l: ItemPointer = 0;
+            while l < r {
+                let m = (l + r) >> 1;
+                if self.get_offs(m) > margin {
+                    // items are allocated from right to left
+                    l = m + 1;
+                } else {
+                    r = m;
+                }
             }
+            debug_assert!(l == r);
         }
-        debug_assert!(l == r);
         // Move first r+1 elements to the new page
         let moved_size = PAGE_SIZE - self.get_offs(r);
 
@@ -1342,7 +1350,7 @@ impl Storage {
             // page is full then divide page
             let pin = self.new_page(db)?;
             let mut new_page = self.pool[pin.buf as usize].write().unwrap();
-            let split = page.split(&mut new_page);
+            let split = page.split(&mut new_page, ip);
             let ok = if ip > split {
                 page.insert_item(ip - split - 1, key, value)
             } else {
