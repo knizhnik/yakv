@@ -1235,7 +1235,7 @@ impl Storage {
                 } else {
                     let mut meta_buf = [0u8; METADATA_SIZE];
                     let len = log.read_at(&mut meta_buf, wal_pos)?;
-                    if len != PAGE_SIZE {
+                    if len != METADATA_SIZE {
                         break;
                     }
                     wal_pos += len as u64;
