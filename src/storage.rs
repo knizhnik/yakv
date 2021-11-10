@@ -993,13 +993,14 @@ impl Storage {
     fn write_page_to_wal(&self, db: &mut Database, buf: BufferId, pid: PageId) -> Result<()> {
         if let Some(log) = &self.log {
             let page = self.pool[buf as usize].read().unwrap();
-            let compressed_data = lz4_flex::compress_prepend_size(&page.data);
+            let compressed_data = lz4_flex::compress(&page.data);
             let compressed_data_len = compressed_data.len();
             let mut tx_buf = Vec::with_capacity(compressed_data_len + 6);
             tx_buf.extend_from_slice(&pid.to_be_bytes());
             tx_buf.extend_from_slice(&(compressed_data_len as u16).to_be_bytes());
             tx_buf.extend_from_slice(&compressed_data);
             log.write_all_at(&tx_buf, db.wal_pos)?;
+			db.tx_crc = crc32c_append(db.tx_crc, &tx_buf);
             db.wal_pos += (compressed_data_len + 6) as u64;
             db.tx_size += compressed_data_len + 6;
         }
@@ -1236,6 +1237,7 @@ impl Storage {
                     if len != compressed_data_len {
                         break;
                     }
+					crc = crc32c_append(crc, &compressed_data);
                     let res = lz4_flex::decompress(&compressed_data, PAGE_SIZE);
                     if let Ok(decompressed_data) = res {
                         page.data.copy_from_slice(&decompressed_data);
