@@ -1,6 +1,7 @@
 use anyhow::{ensure, Result};
 use crc32c::*;
 use fs2::FileExt;
+use lz4_flex;
 use std::cmp::Ordering;
 use std::convert::TryInto;
 use std::fs::{File, OpenOptions};
@@ -991,14 +992,16 @@ impl Storage {
 
     fn write_page_to_wal(&self, db: &mut Database, buf: BufferId, pid: PageId) -> Result<()> {
         if let Some(log) = &self.log {
-            let mut tx_buf = [0u8; PAGE_SIZE + 4];
             let page = self.pool[buf as usize].read().unwrap();
-            tx_buf[0..4].copy_from_slice(&pid.to_be_bytes());
-            tx_buf[4..].copy_from_slice(&page.data);
-            db.tx_crc = crc32c_append(db.tx_crc, &tx_buf);
+            let compressed_data = lz4_flex::compress_prepend_size(&page.data);
+            let compressed_data_len = compressed_data.len();
+            let mut tx_buf = Vec::with_capacity(compressed_data_len + 6);
+            tx_buf.extend_from_slice(&pid.to_be_bytes());
+            tx_buf.extend_from_slice(&(compressed_data_len as u16).to_be_bytes());
+            tx_buf.extend_from_slice(&compressed_data);
             log.write_all_at(&tx_buf, db.wal_pos)?;
-            db.wal_pos += (4 + PAGE_SIZE) as u64;
-            db.tx_size += 4 + PAGE_SIZE;
+            db.wal_pos += (compressed_data_len + 6) as u64;
+            db.tx_size += compressed_data_len + 6;
         }
         Ok(())
     }
@@ -1210,42 +1213,53 @@ impl Storage {
     fn recovery(&self) -> Result<()> {
         let mut db = self.db.write().unwrap();
         if let Some(log) = &self.log {
-            let mut buf = [0u8; 4];
+            let mut buf = [0u8; 6];
             let mut crc = 0u32;
             let mut wal_pos = 0u64;
             db.recovery.wal_size = log.metadata()?.len();
             loop {
                 let len = log.read_at(&mut buf, wal_pos)?;
-                if len != 4 {
+                if len != 6 {
                     // end of log
                     break;
                 }
-                wal_pos += 4;
-                let pid = PageId::from_be_bytes(buf);
+                wal_pos += 6;
+                let pid = PageId::from_be_bytes(buf[0..4].try_into().unwrap());
                 crc = crc32c_append(crc, &buf);
                 if pid != 0 {
+                    let compressed_data_len =
+                        u16::from_be_bytes(buf[4..6].try_into().unwrap()) as usize;
+                    let mut compressed_data = vec![0u8; compressed_data_len];
                     let pin = self.get_page(pid, AccessMode::WriteOnly)?;
                     let mut page = self.pool[pin.buf as usize].write().unwrap();
-                    let len = log.read_at(&mut page.data, wal_pos)?;
-                    if len != PAGE_SIZE {
+                    let len = log.read_at(&mut compressed_data, wal_pos)?;
+                    if len != compressed_data_len {
                         break;
                     }
-                    wal_pos += len as u64;
-                    crc = crc32c_append(crc, &page.data);
+                    let res = lz4_flex::decompress(&compressed_data, PAGE_SIZE);
+                    if let Ok(decompressed_data) = res {
+                        page.data.copy_from_slice(&decompressed_data);
+                        wal_pos += compressed_data_len as u64;
+                    } else {
+                        break;
+                    }
                 } else {
                     let mut meta_buf = [0u8; METADATA_SIZE];
-                    let len = log.read_at(&mut meta_buf, wal_pos)?;
-                    if len != PAGE_SIZE {
+                    let mut crc_buf = [0u8; 4];
+                    meta_buf[0] = buf[4];
+                    meta_buf[1] = buf[5];
+                    let len = log.read_at(&mut meta_buf[2..], wal_pos)?;
+                    if len != METADATA_SIZE - 2 {
                         break;
                     }
                     wal_pos += len as u64;
                     crc = crc32c_append(crc, &meta_buf);
-                    let len = log.read_at(&mut buf, wal_pos)?;
+                    let len = log.read_at(&mut crc_buf, wal_pos)?;
                     if len != 4 {
                         break;
                     }
                     wal_pos += 4;
-                    if u32::from_be_bytes(buf) != crc {
+                    if u32::from_be_bytes(crc_buf) != crc {
                         // CRC mismatch
                         break;
                     }
