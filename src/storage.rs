@@ -1254,7 +1254,7 @@ impl Storage {
                         break;
                     }
                     wal_pos += len as u64;
-                    crc = crc32c_append(crc, &meta_buf);
+                    crc = crc32c_append(crc, &meta_buf[2..]);
                     let len = log.read_at(&mut crc_buf, wal_pos)?;
                     if len != 4 {
                         break;
