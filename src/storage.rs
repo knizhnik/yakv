@@ -742,9 +742,7 @@ impl BufferManager {
                     assert_eq!(self.pages[sync as usize].state, PAGE_DIRTY);
                     if self.pages[sync as usize].access_count == 1 {
                         self.pages[sync as usize].state |= PAGE_SYNCED;
-                        if self.pages[sync as usize].prev != 0 {
-                            self.next_sync = self.pages[sync as usize].prev;
-                        }
+                        self.next_sync = self.pages[sync as usize].prev;
                         let pid = self.pages[sync as usize].pid;
                         next_sync = Some((sync, pid));
                         break;
@@ -779,7 +777,8 @@ impl BufferManager {
         // link to the beginning of dirty list
         if self.dirty_pages != 0 {
             self.pages[self.dirty_pages as usize].prev = id;
-        } else {
+        }
+        if self.next_sync == 0 {
             self.next_sync = id;
         }
         self.pages[id as usize].next = self.dirty_pages;
@@ -1259,6 +1258,7 @@ impl Storage {
                     db.meta_updated = false;
                     db.recovery.recovered_transactions += 1;
                     db.recovery.recovery_end = wal_pos;
+                    crc = 0u32;
                 }
             }
             self.rollback(&mut db)?;
@@ -1913,6 +1913,16 @@ impl Storage {
                 db.state = DatabaseState::Closed;
             }
         }
+        Ok(())
+    }
+
+    ///
+    /// Shutdown storage. Unlike close it does't commit delayed transactions, flush data file and truncatate WAL.
+    ///
+    pub fn shutdown(&self) -> Result<()> {
+        let mut db = self.db.write().unwrap();
+        ensure!(db.state == DatabaseState::Opened);
+        db.state = DatabaseState::Closed;
         Ok(())
     }
 
