@@ -381,6 +381,51 @@ fn test_acid() {
     assert_eq!(store.iter().count(), 100);
 }
 
+#[test]
+fn test_recovery() {
+    let data_path = Path::new("test11.dbs");
+    let log_path = Path::new("test11.log");
+    const N_KEYS: u64 = 100000;
+    {
+        let _ = std::fs::remove_file(&data_path);
+        let _ = std::fs::remove_file(&log_path);
+        let mut cfg = StorageConfig::default();
+        cfg.wal_flush_threshold = 1;
+        let store = Storage::open(data_path, Some(log_path), cfg).unwrap();
+        {
+            let mut trans = store.start_transaction();
+            for key in 0..N_KEYS {
+                trans.put(&pack(key), &v(b"first")).unwrap();
+            }
+            trans.commit().unwrap();
+        }
+        {
+            let mut trans = store.start_transaction();
+            for key in 0..N_KEYS {
+                trans.put(&pack(key), &v(b"two")).unwrap();
+            }
+            trans.commit().unwrap();
+        }
+        {
+            let mut trans = store.start_transaction();
+            for key in 0..N_KEYS {
+                trans.put(&pack(key), &v(b"three")).unwrap();
+            }
+            // transaction shoud be implicitly aborted
+        }
+        store.shutdown().unwrap(); // do not truncate WAL
+    }
+    {
+        let store = Storage::open(data_path, Some(log_path), StorageConfig::default()).unwrap();
+        let recovery = store.get_recovery_status();
+        assert_eq!(recovery.recovered_transactions, 2);
+        assert!(recovery.wal_size > recovery.recovery_end);
+        for key in 0..N_KEYS {
+            assert_eq!(store.get(&pack(key)).unwrap().unwrap(), v(b"two"));
+        }
+    }
+}
+
 fn do_inserts(s: Arc<Storage>, tid: u32, n_records: u32) -> Result<()> {
     let tid_bytes = tid.to_be_bytes();
     for id in 0..n_records {
