@@ -14,6 +14,7 @@ readme = "README.md"
 crc32c = "0.6.0"
 fs2 = "0.4.3"
 anyhow = "1.0"
+parking_lot = "0.11.1"
 
 [dev-dependencies]
 rand = "0.8.3"
