@@ -16,7 +16,7 @@ const N_RECORDS_SMALL: usize = 10000;
 
 #[test]
 fn test_basic_ops() {
-    let store = open_store("test1.dbs", Some("test1.log"));
+    let store = open_store("test1.dbs", false);
     {
         let mut trans = store.start_transaction();
         trans.put(&v(b"1"), &v(b"one")).unwrap();
@@ -105,14 +105,14 @@ fn test_basic_ops() {
 
 fn seq_benchmark(
     db_path: &str,
-    log_path: Option<&str>,
+    nosync: bool,
     n_records: usize,
     transaction_size: usize,
 ) -> Result<()> {
     let payload1: Vec<u8> = vec![1u8; 100];
     let payload2: Vec<u8> = vec![2u8; 100];
     {
-        let store = open_store(db_path, log_path);
+        let store = open_store(db_path, nosync);
         let mut key: u64 = 0;
 
         let mut now = Instant::now();
@@ -165,7 +165,7 @@ fn seq_benchmark(
     }
     {
         // reopen database
-        let store = reopen_store(db_path, log_path);
+        let store = reopen_store(db_path, nosync);
 
         let mut now = Instant::now();
         for i in 1..=n_records {
@@ -200,14 +200,14 @@ fn seq_benchmark(
 
 fn rnd_benchmark(
     db_path: &str,
-    log_path: Option<&str>,
+    nosync: bool,
     n_records: usize,
     transaction_size: usize,
 ) -> Result<()> {
     let payload1: Vec<u8> = vec![1u8; 100];
     let payload2: Vec<u8> = vec![2u8; 100];
     {
-        let store = open_store(db_path, log_path);
+        let store = open_store(db_path, nosync);
 
         let mut rand = StdRng::seed_from_u64(RAND_SEED);
         let mut now = Instant::now();
@@ -258,7 +258,7 @@ fn rnd_benchmark(
     }
     {
         // reopen database
-        let store = reopen_store(db_path, log_path);
+        let store = reopen_store(db_path, nosync);
 
         let mut now = Instant::now();
         let mut rand = StdRng::seed_from_u64(RAND_SEED);
@@ -290,48 +290,48 @@ fn rnd_benchmark(
 }
 
 #[test]
-fn seq_benchmark_wal_large_trans() {
-    assert!(seq_benchmark("test2.dbs", Some("test2.log"), N_RECORDS_LARGE, 1000,).is_ok());
+fn seq_benchmark_sync_large_trans() {
+    assert!(seq_benchmark("test2.dbs", false, N_RECORDS_LARGE, 1000,).is_ok());
 }
 
 #[test]
-fn seq_benchmark_wal_small_trans() {
-    assert!(seq_benchmark("test3.dbs", Some("test3.log"), N_RECORDS_SMALL, 1,).is_ok());
+fn seq_benchmark_sync_small_trans() {
+    assert!(seq_benchmark("test3.dbs", false, N_RECORDS_SMALL, 1,).is_ok());
 }
 
 #[test]
-fn seq_benchmark_nowal_large_trans() {
-    assert!(seq_benchmark("test4.dbs", None, N_RECORDS_LARGE, 1000,).is_ok());
+fn seq_benchmark_nosync_large_trans() {
+    assert!(seq_benchmark("test4.dbs", true, N_RECORDS_LARGE, 1000,).is_ok());
 }
 
 #[test]
-fn seq_benchmark_nowal_small_trans() {
-    assert!(seq_benchmark("test5.dbs", None, N_RECORDS_LARGE, 1,).is_ok());
+fn seq_benchmark_nosync_small_trans() {
+    assert!(seq_benchmark("test5.dbs", true, N_RECORDS_LARGE, 1,).is_ok());
 }
 
 #[test]
-fn rnd_benchmark_wal_large_trans() {
-    assert!(rnd_benchmark("test6.dbs", Some("test6.log"), N_RECORDS_LARGE, 1000,).is_ok());
+fn rnd_benchmark_sync_large_trans() {
+    assert!(rnd_benchmark("test6.dbs", false, N_RECORDS_LARGE, 1000,).is_ok());
 }
 
 #[test]
-fn rnd_benchmark_wal_small_trans() {
-    assert!(rnd_benchmark("test7.dbs", Some("test7.log"), N_RECORDS_SMALL, 1,).is_ok());
+fn rnd_benchmark_sync_small_trans() {
+    assert!(rnd_benchmark("test7.dbs", false, N_RECORDS_SMALL, 1,).is_ok());
 }
 
 #[test]
-fn rnd_benchmark_nowal_large_trans() {
-    assert!(rnd_benchmark("test8.dbs", None, N_RECORDS_LARGE, 1000,).is_ok());
+fn rnd_benchmark_nosync_large_trans() {
+    assert!(rnd_benchmark("test8.dbs", true, N_RECORDS_LARGE, 1000,).is_ok());
 }
 
 #[test]
-fn rnd_benchmark_nowal_small_trans() {
-    assert!(rnd_benchmark("test9.dbs", None, N_RECORDS_LARGE, 1,).is_ok());
+fn rnd_benchmark_nosync_small_trans() {
+    assert!(rnd_benchmark("test9.dbs", true, N_RECORDS_LARGE, 1,).is_ok());
 }
 
 #[test]
 fn test_acid() {
-    let store = open_store("test10.dbs", Some("test10.log"));
+    let store = open_store("test10.dbs", false);
 
     assert!(store
         .put_all(&mut (0..100).map(|key| {
@@ -384,14 +384,12 @@ fn test_acid() {
 #[test]
 fn test_recovery() {
     let data_path = Path::new("test11.dbs");
-    let log_path = Path::new("test11.log");
     const N_KEYS: u64 = 100000;
     {
         let _ = std::fs::remove_file(&data_path);
-        let _ = std::fs::remove_file(&log_path);
         let mut cfg = StorageConfig::default();
         cfg.wal_flush_threshold = 1;
-        let store = Storage::open(data_path, Some(log_path), cfg).unwrap();
+        let store = Storage::open(data_path, false, cfg).unwrap();
         {
             let mut trans = store.start_transaction();
             for key in 0..N_KEYS {
@@ -416,7 +414,7 @@ fn test_recovery() {
         store.shutdown().unwrap(); // do not truncate WAL
     }
     {
-        let store = Storage::open(data_path, Some(log_path), StorageConfig::default()).unwrap();
+        let store = Storage::open(data_path, false, StorageConfig::default()).unwrap();
         let recovery = store.get_recovery_status();
         assert_eq!(recovery.recovered_transactions, 2);
         assert!(recovery.wal_size > recovery.recovery_end);
@@ -489,18 +487,17 @@ fn pack(key: u64) -> Vec<u8> {
     key.to_be_bytes().to_vec()
 }
 
-fn open_store(data_file: &str, log_file: Option<&str>) -> Storage {
+fn open_store(data_file: &str, nosync: bool) -> Storage {
     let data_path = Path::new(data_file);
-    let log_path = log_file.map(|wal| Path::new(wal));
     let _ = std::fs::remove_file(&data_path);
-    if let Some(log) = log_path {
-        let _ = std::fs::remove_file(&log);
-    }
-    Storage::open(data_path, log_path, StorageConfig::default()).unwrap()
+    let mut cfg = StorageConfig::default();
+    cfg.nosync = nosync;
+    Storage::open(data_path, cfg).unwrap()
 }
 
-fn reopen_store(data_file: &str, log_file: Option<&str>) -> Storage {
+fn reopen_store(data_file: &str, nosync: bool) -> Storage {
     let data_path = Path::new(data_file);
-    let log_path = log_file.map(|wal| Path::new(wal));
-    Storage::open(data_path, log_path, StorageConfig::default()).unwrap()
+    let mut cfg = StorageConfig::default();
+    cfg.nosync = nosync;
+    Storage::open(data_path, cfg).unwrap()
 }

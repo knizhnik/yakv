@@ -1,5 +1,4 @@
 use anyhow::{ensure, Result};
-use crc32c::*;
 use fs2::FileExt;
 use std::cmp::Ordering;
 use std::convert::TryInto;
@@ -10,6 +9,7 @@ use std::ops::{Bound, RangeBounds};
 use std::os::unix::prelude::FileExt as UnixFileExt;
 use std::path::Path;
 use std::sync::{Condvar, Mutex, RwLock, RwLockWriteGuard};
+use std::collections::HashMap;
 
 type PageId = u32; // address of page in the file
 type BufferId = u32; // index of page in buffer cache
@@ -31,7 +31,8 @@ pub type Value = Vec<u8>;
 const PAGE_SIZE: usize = 8192;
 const MAGIC: u32 = 0xBACE2021;
 const VERSION: u32 = 1;
-const METADATA_SIZE: usize = 7 * 4;
+const N_BITMAP_PAGES: usize = PAGE_SIZE/4 - 6; // number of memory allocator bitmap pages
+const ALLOC_BITMAP_SIZE: usize = PAGE_SIZE * 8;  // number of pages mapped by one allocator bitmap page
 const PAGE_HEADER_SIZE: usize = 2; // now page header contains just number of items in the page
 const MAX_VALUE_LEN: usize = PAGE_SIZE / 4; // assume that pages may fit at least 3 items
 const MAX_KEY_LEN: usize = u8::MAX as usize; // should fit in one byte
@@ -42,7 +43,6 @@ const PAGE_RAW: u16 = 1; // buffer content is uninitialized
 const PAGE_BUSY: u16 = 2; // buffer is loaded for the disk
 const PAGE_DIRTY: u16 = 4; // buffer was updates
 const PAGE_WAIT: u16 = 8; // some thread waits until buffer is loaded
-const PAGE_SYNCED: u16 = 16; // dirty pages was saved to log
 
 enum LookupOp<'a> {
     First,
@@ -54,10 +54,18 @@ enum LookupOp<'a> {
 
 #[derive(PartialEq, Copy, Clone, Debug)]
 pub enum DatabaseState {
-    InRecovery,
     Opened,
     Closed,
     Corrupted,
+}
+
+//
+// Operations with alloactor bitmap
+//
+enum BitmapOp {
+    Probe,
+    Set,
+    Clear
 }
 
 ///
@@ -67,27 +75,17 @@ pub enum DatabaseState {
 pub struct StorageConfig {
     /// Buffer pool (pages)
     pub cache_size: usize,
-    /// Maximal size of WAL. When it is reached, database file is synced and WAL is rotated
-    /// (write starts from the beginning)
-    pub checkpoint_interval: u64,
-    /// Threshold for flushing dirty pages to WAL (to reduce commit time)
-    pub wal_flush_threshold: BufferId,
+    // Do not sync written pages
+    pub nosync: bool,
 }
 
 impl StorageConfig {
     pub fn default() -> StorageConfig {
         StorageConfig {
-            cache_size: 128 * 1024,                         // 1Gb
-            checkpoint_interval: 1u64 * 1024 * 1024 * 1024, // 1Gb
-            wal_flush_threshold: BufferId::MAX,
+            cache_size: 128 * 1024, // 1Gb
+	    nosync: false
         }
     }
-}
-
-#[derive(PartialEq)]
-enum AccessMode {
-    ReadOnly,
-    WriteOnly,
 }
 
 ///
@@ -111,20 +109,6 @@ pub struct Transaction<'a> {
 }
 
 ///
-/// Status of automatic database recovery after open.
-/// In case of start after normal shutdown all fields should be zero.
-///
-#[derive(Clone, Copy, Default)]
-pub struct RecoveryStatus {
-    /// number of recovered transactions
-    pub recovered_transactions: u64,
-    /// size of WAL at the moment of recovery
-    pub wal_size: u64,
-    /// position of last recovery transaction in WAL
-    pub recovery_end: u64,
-}
-
-///
 /// Database info
 ///
 #[derive(Clone, Copy, Debug)]
@@ -135,12 +119,14 @@ pub struct DatabaseInfo {
     pub db_size: u64,
     /// Total size of used pages
     pub db_used: u64,
-    /// Current WAL size
-    pub log_size: u64,
     /// number of committed transactions in this session
     pub n_committed_transactions: u64,
     /// number of aborted transactions in this session
     pub n_aborted_transactions: u64,
+    /// Number of allocated pages since session start
+    pub n_alloc_pages: u64,
+    /// Number of deallocated pages since session start
+    pub n_free_pages: u64,
     /// State of the database
     pub state: DatabaseState,
 }
@@ -326,9 +312,22 @@ pub struct Storage {
     buf_mgr: Mutex<BufferManager>,
     busy_events: [Condvar; N_BUSY_EVENTS],
     pool: Vec<RwLock<PageData>>,
-    conf: StorageConfig,
     file: File,
-    log: Option<File>,
+    conf: StorageConfig,
+}
+
+#[derive(Clone, Copy, Default)]
+struct L2List {
+    next: BufferId,
+    prev: BufferId,
+}
+
+
+impl L2List {
+    fn prune(&mut self) {
+	self.next = 0;
+	self.prev = 0;
+    }
 }
 
 //
@@ -338,9 +337,7 @@ pub struct Storage {
 struct PageHeader {
     pid: PageId,
     collision: BufferId, // collision chain
-    // LRU l2-list
-    next: BufferId,
-    prev: BufferId,
+    list: L2List, // LRU l2-list
     access_count: u16,
     state: u16, // bitmask of PAGE_RAW, PAGE_DIRTY, ...
 }
@@ -358,21 +355,21 @@ impl PageHeader {
 struct Metadata {
     magic: u32,   // storage magic
     version: u32, // storage format version
-    free: PageId, // L1 list of free pages
     size: PageId, // size of database (pages)
     used: PageId, // number of used database pages
     root: PageId, // B-Tree root page
     height: u32,  // height of B-Tree
+    alloc_pages: [PageId; N_BITMAP_PAGES], // allocator bitmap pages
 }
 
 impl Metadata {
-    fn pack(self) -> [u8; METADATA_SIZE] {
-        unsafe { std::mem::transmute::<Metadata, [u8; METADATA_SIZE]>(self) }
+    fn pack(self) -> [u8; PAGE_SIZE] {
+        unsafe { std::mem::transmute::<Metadata, [u8; PAGE_SIZE]>(self) }
     }
     fn unpack(buf: &[u8]) -> Metadata {
         unsafe {
-            std::mem::transmute::<[u8; METADATA_SIZE], Metadata>(
-                buf[0..METADATA_SIZE].try_into().unwrap(),
+            std::mem::transmute::<[u8; PAGE_SIZE], Metadata>(
+                buf[0..PAGE_SIZE].try_into().unwrap(),
             )
         }
     }
@@ -383,14 +380,16 @@ impl Metadata {
 //
 struct Database {
     meta: Metadata,           // cached metadata (stored in root page)
-    meta_updated: bool,       // whether metadata was updated
     lsn: LSN,                 // database modification counter
     n_aborted_txns: LSN,      // number of aborted transactions
     state: DatabaseState,     // database state
-    wal_pos: u64,             // current position in log file
-    tx_crc: u32,              // accumulated CRC of the current transaction
-    tx_size: usize,           // current transaction size
-    recovery: RecoveryStatus, // status of recovery
+    alloc_page: usize,        // index of current allocator internal page
+    alloc_page_pos: usize,    // allocator current position in internal page
+    cow_map: HashMap<PageId,PageId>,  // copy-on-write map: we have to store this mapping to avoid creation of redundant copies
+    pending_deletes: Vec<PageId>, // we can no immedately delete pages, because deleted page can be reused and can not be stored in `cow` map
+    recursive_alloc: bool,    // we are allocating page for allocator itself
+    n_alloc_pages: u64,       // number of allocated pages since session start
+    n_free_pages: u64,        // number of deallocated pages since session start
 }
 
 impl Database {
@@ -399,10 +398,11 @@ impl Database {
             db_size: self.meta.size as u64 * PAGE_SIZE as u64,
             db_used: self.meta.used as u64 * PAGE_SIZE as u64,
             tree_height: self.meta.height as usize,
-            log_size: self.wal_pos,
             state: self.state,
             n_committed_transactions: self.lsn,
             n_aborted_transactions: self.n_aborted_txns,
+	    n_alloc_pages: self.n_alloc_pages,
+	    n_free_pages: self.n_free_pages,
         }
     }
 }
@@ -415,13 +415,9 @@ impl Database {
 // Page with index 0 is reserved in buffer manager for root page. It is not included in any list, so 0 is treated as terminator.
 //
 struct BufferManager {
-    // LRU l2-list
-    head: BufferId,
-    tail: BufferId,
-
+    lru: L2List,           // LRU l2-list
+    dirty_pages: L2List,   // L2-list of dirty pages
     free_pages: BufferId,  // L1-list of free pages
-    dirty_pages: BufferId, // L2-list of dirty pages
-    next_sync: BufferId,   // next page to be written to WAL
 
     used: BufferId,    // used part of page pool
     pinned: BufferId,  // amount of pinned pages
@@ -462,7 +458,13 @@ impl PageData {
         self.get_u32(offs + key_len + 1)
     }
 
-    fn get_key(&self, ip: ItemPointer) -> Key {
+    fn set_child(&mut self, ip: ItemPointer, pid: PageId) {
+        let offs = self.get_offs(ip);
+        let key_len = self.data[offs] as usize;
+        self.set_u32(offs + key_len + 1, pid)
+    }
+
+   fn get_key(&self, ip: ItemPointer) -> Key {
         let offs = self.get_offs(ip);
         let key_len = self.data[offs] as usize;
         self.data[offs + 1..offs + 1 + key_len].to_vec()
@@ -507,6 +509,30 @@ impl PageData {
 
     fn get_u32(&self, offs: usize) -> u32 {
         u32::from_be_bytes(self.data[offs..offs + 4].try_into().unwrap())
+    }
+
+    fn test_and_set_bit(&mut self, bit: usize) -> bool {
+	if (self.data[bit >> 3] & (1 << (bit & 7))) == 0 {
+	    self.data[bit >> 3] |= 1 << (bit & 7);
+	    true
+	} else {
+	    false
+	}
+    }
+
+    fn clear_bit(&mut self, bit: usize) {
+        debug_assert!((self.data[bit >> 3] & (1 << (bit & 7))) != 0);
+	self.data[bit >> 3] &= !(1 << (bit & 7));
+    }
+
+    fn find_first_zero_bit(&self, offs: usize) -> usize {
+	let bytes = self.data;
+	for i in offs..PAGE_SIZE {
+	    if bytes[i] != 0xFFu8 {
+		return i * 8 + bytes[i].leading_ones() as usize;
+	    }
+	}
+	usize::MAX
     }
 
     fn get_n_items(&self) -> ItemPointer {
@@ -656,15 +682,15 @@ impl BufferManager {
     fn unpin(&mut self, id: BufferId) {
         debug_assert!(self.pages[id as usize].access_count == 1);
         self.pages[id as usize].access_count = 0;
-        self.pages[id as usize].next = self.head;
-        self.pages[id as usize].prev = 0;
+        self.pages[id as usize].list.next = self.lru.next;
+        self.pages[id as usize].list.prev = 0;
         self.pinned -= 1;
-        if self.head != 0 {
-            self.pages[self.head as usize].prev = id;
+        if self.lru.next != 0 {
+            self.pages[self.lru.next as usize].list.prev = id;
         } else {
-            self.tail = id;
+            self.lru.prev = id;
         }
-        self.head = id;
+        self.lru.next = id;
     }
 
     //
@@ -672,17 +698,17 @@ impl BufferManager {
     //
     fn pin(&mut self, id: BufferId) {
         debug_assert!(self.pages[id as usize].access_count == 0);
-        let next = self.pages[id as usize].next;
-        let prev = self.pages[id as usize].prev;
+        let next = self.pages[id as usize].list.next;
+        let prev = self.pages[id as usize].list.prev;
         if prev == 0 {
-            self.head = next;
+            self.lru.next = next;
         } else {
-            self.pages[prev as usize].next = next;
+            self.pages[prev as usize].list.next = next;
         }
         if next == 0 {
-            self.tail = prev;
+            self.lru.prev = prev;
         } else {
-            self.pages[next as usize].prev = prev;
+            self.pages[next as usize].list.prev = prev;
         }
         self.pinned += 1;
     }
@@ -717,74 +743,60 @@ impl BufferManager {
     //
     fn throw_buffer(&mut self, id: BufferId) {
         self.remove(id);
-        self.pages[id as usize].next = self.free_pages;
+        self.pages[id as usize].list.next = self.free_pages;
         self.free_pages = id;
         self.cached -= 1;
     }
 
     //
-    // If buffer is not yet marked as dirty then mark it as dirty and pin until the end of transaction
+    // Try to locate buffer with specified PID and throw away it from cache
+    //
+    fn forget_buffer(&mut self, pid: PageId) {
+        let hash = pid as usize % self.hash_table.len();
+        let mut buf = self.hash_table[hash];
+        while buf != 0 {
+            if self.pages[buf as usize].pid == pid {
+		self.throw_buffer(buf);
+		break;
+	    }
+	    buf = self.pages[buf as usize].collision;
+	}
+    }
+
+    //
+    // If buffer is not yet marked as dirty then mark it as dirty and return true
     //
     fn modify_buffer(
         &mut self,
         id: BufferId,
-        wal_flush_threshold: BufferId,
-    ) -> Result<Option<(BufferId, PageId)>> {
+    ) -> bool {
         debug_assert!(self.pages[id as usize].access_count > 0);
-        let mut next_sync: Option<(BufferId, PageId)> = None;
         if (self.pages[id as usize].state & PAGE_DIRTY) == 0 {
             self.pages[id as usize].access_count += 1; // pin dirty page in memory
             self.pages[id as usize].state = PAGE_DIRTY;
             self.dirtied += 1;
-            if self.dirtied > wal_flush_threshold {
-                let mut sync = self.next_sync;
-                while sync != 0 {
-                    assert_eq!(self.pages[sync as usize].state, PAGE_DIRTY);
-                    if self.pages[sync as usize].access_count == 1 {
-                        self.pages[sync as usize].state |= PAGE_SYNCED;
-                        self.next_sync = self.pages[sync as usize].prev;
-                        let pid = self.pages[sync as usize].pid;
-                        next_sync = Some((sync, pid));
-                        break;
-                    }
-                    sync = self.pages[sync as usize].prev;
-                }
+
+	    // Link in dirty list
+            self.pages[id as usize].list.next = self.dirty_pages.next;
+            self.pages[id as usize].list.prev = 0;
+            if self.dirty_pages.next != 0 {
+            self.pages[self.dirty_pages.next as usize].list.prev = id;
+            } else {
+		self.dirty_pages.prev = id;
             }
+            self.dirty_pages.next = id;
+	    true
         } else {
-            // we have to write page to the log once again
-            self.pages[id as usize].state &= !PAGE_SYNCED;
+	    false
+	}
+    }
 
-            let prev = self.pages[id as usize].prev;
-
-            // Move page to the beginning of L2 list
-            if prev == 0 {
-                // already first page: do nothing
-                return Ok(None);
-            }
-
-            // If this page was scheduled for flush, then use previous page instead
-            if self.next_sync == id {
-                self.next_sync = prev;
-            }
-
-            // unlink page
-            let next = self.pages[id as usize].next;
-            self.pages[prev as usize].next = next;
-            if next != 0 {
-                self.pages[next as usize].prev = prev;
-            }
-        }
-        // link to the beginning of dirty list
-        if self.dirty_pages != 0 {
-            self.pages[self.dirty_pages as usize].prev = id;
-        }
-        if self.next_sync == 0 {
-            self.next_sync = id;
-        }
-        self.pages[id as usize].next = self.dirty_pages;
-        self.pages[id as usize].prev = 0;
-        self.dirty_pages = id;
-        Ok(next_sync)
+    //
+    // Change pid for copied buffer
+    fn copy_on_write(&mut self, id: BufferId, new_pid: PageId) {
+	self.remove(id);
+	self.pages[id as usize].pid = new_pid;
+	self.insert(id);
     }
 
     //
@@ -793,7 +805,6 @@ impl BufferManager {
     fn release_buffer(&mut self, id: BufferId) {
         debug_assert!(self.pages[id as usize].access_count > 0);
         if self.pages[id as usize].access_count == 1 {
-            debug_assert!((self.pages[id as usize].state & PAGE_DIRTY) == 0);
             self.unpin(id);
         } else {
             self.pages[id as usize].access_count -= 1;
@@ -801,52 +812,79 @@ impl BufferManager {
     }
 
     //
-    // Find buffer with specified page or allocate new buffer
+    // Find buffer with specified page or allocate new buffer.
+    // Returns id of located buffer and dirty evicted page id (or 0 if none)
     //
-    fn get_buffer(&mut self, pid: PageId) -> Result<BufferId> {
+    fn get_buffer(&mut self, pid: PageId) -> Result<(BufferId,PageId)> {
         let hash = pid as usize % self.hash_table.len();
-        let mut h = self.hash_table[hash];
-        while h != 0 {
-            if self.pages[h as usize].pid == pid {
-                let access_count = self.pages[h as usize].access_count;
+        let mut buf = self.hash_table[hash];
+        while buf != 0 {
+            if self.pages[buf as usize].pid == pid {
+                let access_count = self.pages[buf as usize].access_count;
                 debug_assert!(access_count < u16::MAX - 1);
                 if access_count == 0 {
-                    self.pin(h);
+                    self.pin(buf);
                 }
-                self.pages[h as usize].access_count = access_count + 1;
-                return Ok(h);
+                self.pages[buf as usize].access_count = access_count + 1;
+                return Ok((buf,0));
             }
-            h = self.pages[h as usize].collision;
+            buf = self.pages[buf as usize].collision;
         }
+	self.new_buffer(pid)
+    }
+
+    //
+    // Allocate new buffer.
+    //
+    fn new_buffer(&mut self, pid: PageId) -> Result<(BufferId,PageId)> {
         // page not found in cache
-        h = self.free_pages;
-        if h != 0 {
+	let mut evicted_pid = 0;
+        let mut buf = self.free_pages;
+        if buf != 0 {
             // has some free pages
-            self.free_pages = self.pages[h as usize].next;
+            self.free_pages = self.pages[buf as usize].list.next;
             self.cached += 1;
             self.pinned += 1;
+	    self.pages[buf as usize].state = 0;
         } else {
-            h = self.used;
-            if (h as usize) < self.hash_table.len() {
+            buf = self.used;
+            if (buf as usize) < self.hash_table.len() {
                 self.used += 1;
                 self.cached += 1;
                 self.pinned += 1;
             } else {
                 // Replace least recently used page
-                let victim = self.tail;
+                let victim = self.lru.prev;
                 ensure!(victim != 0);
                 debug_assert!(self.pages[victim as usize].access_count == 0);
-                debug_assert!((self.pages[victim as usize].state & PAGE_DIRTY) == 0);
+		if (self.pages[victim as usize].state & PAGE_DIRTY) != 0 {
+		    // remove page from dirty list
+		    self.dirtied -= 1;
+		    let next = self.pages[victim as usize].list.next;
+		    let prev = self.pages[victim as usize].list.prev;
+		    if next != 0 {
+			self.pages[next as usize].list.prev = prev;
+		    } else {
+			self.dirty_pages.prev = prev;
+		    }
+		    if prev != 0 {
+			self.pages[prev as usize].list.next = next;
+		    } else {
+			self.dirty_pages.next = next;
+		    }
+		    evicted_pid = self.pages[victim as usize].pid;
+		}
+                debug_assert!((self.pages[victim as usize].state & (PAGE_BUSY|PAGE_RAW)) == 0);
                 self.pin(victim);
                 self.remove(victim);
-                h = victim;
+                buf = victim;
             }
         }
-        self.pages[h as usize].access_count = 1;
-        self.pages[h as usize].pid = pid;
-        self.pages[h as usize].state = PAGE_RAW;
-        self.insert(h);
-        Ok(h)
+        self.pages[buf as usize].access_count = 1;
+        self.pages[buf as usize].pid = pid;
+        self.pages[buf as usize].state = PAGE_RAW;
+        self.insert(buf);
+        Ok((buf, evicted_pid))
     }
 }
 
@@ -854,6 +892,29 @@ struct PageGuard<'a> {
     buf: BufferId,
     pid: PageId,
     storage: &'a Storage,
+}
+
+impl<'a> PageGuard<'a> {
+    //
+    // Copy on write page
+    //
+    fn modify(&mut self, db: &mut Database) -> Result<()> {
+        let mut bm = self.storage.buf_mgr.lock().unwrap();
+        if bm.modify_buffer(self.buf) { // first update of the page
+	    let old_pid = bm.pages[self.buf as usize].pid;
+	    drop(bm);
+	    // Check if it is already copied
+	    if !db.cow_map.contains_key(&old_pid) {
+		// Create copy
+		let new_pid = self.storage.allocate_page(db)?;
+		db.cow_map.insert(new_pid, old_pid); // remember COW mapping
+		self.pid = new_pid;
+		self.storage.buf_mgr.lock().unwrap().copy_on_write(self.buf, new_pid);
+		self.storage.prepare_free_page(db, old_pid)?; // prepare deallocation of original page
+	    }
+	}
+	Ok(())
+    }
 }
 
 impl<'a> Drop for PageGuard<'a> {
@@ -867,6 +928,125 @@ impl<'a> Drop for PageGuard<'a> {
 //
 impl Storage {
     //
+    // Allocate page
+    //
+    fn allocate_page(&self, db: &mut Database) -> Result<PageId> {
+	db.n_alloc_pages += 1;
+	if db.recursive_alloc {
+	    // Allocator is called inside allocation of allocator internal pages.
+	    // To avoid infinite recusrion we are using fast allocation method: just
+	    // extend database by adding new page
+	    let new_page = db.meta.size;
+	    db.meta.size += 1;
+	    self.mark_page(db, new_page)?;
+	    return Ok(new_page);
+	}
+	//
+	// Cyclic scan of bitmap pages. We start with position pointed by (alloca_page,alloc_page_pos)
+	// and continue iteration until we hole or reach end of bitmap.
+	// In the last case we restart scanning from the beginning but if not hole is found on this pass,
+	// then append new bitmap page
+	//
+	let mut first_pass = true;
+	loop { // loop through all bitmap pages
+	    let mut pin;
+	    let bp = db.meta.alloc_pages[db.alloc_page];
+	    if bp == 0 { // bitmap page doesn't exists
+		if first_pass && db.alloc_page != 0 {
+		    // restart search from the beginning
+		    db.alloc_page = 0;
+		    first_pass = false;
+		    continue;
+		}
+		// Allocate new allocator's internal page
+		db.recursive_alloc = true; // prevent infinite recursion
+		pin = self.new_page(db)?;
+		db.meta.alloc_pages[db.alloc_page] = pin.pid;
+		if db.alloc_page == 0 {
+		    // Ininialize first bitmap page: we need to mark root page as busy
+		    assert!(self.pool[pin.buf as usize].write().unwrap().test_and_set_bit(0));
+		}
+		db.recursive_alloc = false;
+	    } else {
+		// Open existed internal page
+		pin = self.get_page(bp)?;
+	    }
+	    let bit = self.pool[pin.buf as usize].read().unwrap().find_first_zero_bit(db.alloc_page_pos);
+	    if bit != usize::MAX { // hole located
+		pin.modify(db)?;
+		db.meta.alloc_pages[db.alloc_page] = pin.pid;
+
+		// Copying of allocator's pages can occupy hole we have found,
+		// so we need first to check if it is still available
+		if self.pool[pin.buf as usize].write().unwrap().test_and_set_bit(bit) {
+		    let pid = (db.alloc_page * ALLOC_BITMAP_SIZE + bit) as PageId;
+		    db.alloc_page_pos = bit/8;
+		    db.meta.used += 1;
+		    return Ok(pid);
+		}
+	    } else {
+		// No free space in this bitmap page, try next page
+		db.alloc_page_pos = 0;
+		db.alloc_page += 1;
+		if db.alloc_page == N_BITMAP_PAGES {
+		    ensure!(first_pass); // OOM detection: all 32Tb are used
+		    // Restart scanning from the beginning
+		    db.alloc_page = 0;
+		    first_pass = false;
+		}
+	    }
+	}
+    }
+
+    fn update_allocator_bitmap(&self, db: &mut Database, pid: PageId, op: BitmapOp) -> Result<()> {
+	let alloc_page = pid as usize / ALLOC_BITMAP_SIZE;
+	let bit = pid as usize % ALLOC_BITMAP_SIZE;
+	let bp = db.meta.alloc_pages[alloc_page];
+	let mut pin = self.get_page(bp)?;
+	pin.modify(db)?;
+	db.meta.alloc_pages[alloc_page] = pin.pid;
+
+	match op {
+	    BitmapOp::Probe => {
+		// All allocator pages related to this pid are copied: we are ready to perform free operation
+	    }
+	    BitmapOp::Set => {
+		// Nobody else should use this slot
+		assert!(self.pool[pin.buf as usize].write().unwrap().test_and_set_bit(bit))
+	    }
+	    BitmapOp::Clear => {
+		// Set allocator's current position to just deallocated page to force its reusing
+		db.alloc_page = alloc_page;
+		db.alloc_page_pos = bit/8;
+		self.pool[pin.buf as usize].write().unwrap().clear_bit(bit)
+	    }
+	}
+	Ok(())
+    }
+
+    //
+    // When we start deallocation of original pages during commit,
+    // we can not perform allocations any more, because allocated page
+    // may overwrite original page and we loose consistent state in case
+    // of abnormal transaction termination. So we first need to "probe"
+    // deallocation, enforcing copying of all affected allocator's pages.
+    //
+    fn prepare_free_page(&self, db: &mut Database, pid: PageId) -> Result<()> {
+	self.update_allocator_bitmap(db, pid, BitmapOp::Probe)
+    }
+
+    fn mark_page(&self, db: &mut Database, pid: PageId) -> Result<()> {
+	self.update_allocator_bitmap(db, pid, BitmapOp::Set)
+    }
+
+    fn free_page(&self, db: &mut Database, pid: PageId) -> Result<()> {
+	self.update_allocator_bitmap(db, pid, BitmapOp::Clear)?;
+	db.meta.used -= 1;
+	db.n_free_pages += 1;
+	Ok(())
+    }
+
+    //
     // Unpin page (called by PageGuard)
     //
     fn release_page(&self, buf: BufferId) {
@@ -878,32 +1058,22 @@ impl Storage {
     // Allocate new page in storage and get buffer for it
     //
     fn new_page(&self, db: &mut Database) -> Result<PageGuard<'_>> {
-        let free = db.meta.free;
-        let buf;
+        let pid = self.allocate_page(db)?;
         let mut bm = self.buf_mgr.lock().unwrap();
-        if free != 0 {
-            buf = bm.get_buffer(free)?;
-            let mut page = self.pool[buf as usize].write().unwrap();
-            if (bm.pages[buf as usize].state & PAGE_RAW) != 0 {
-                self.file
-                    .read_exact_at(&mut page.data, free as u64 * PAGE_SIZE as u64)?;
-            }
-            db.meta.free = page.get_u32(0);
-            page.data.fill(0u8);
-        } else {
-            // extend storage
-            buf = bm.get_buffer(db.meta.size)?;
-            db.meta.size += 1;
-            let mut page = self.pool[buf as usize].write().unwrap();
-            page.data.fill(0u8);
-        }
-        db.meta.used += 1;
-        db.meta_updated = true;
-        self.modify_buffer(db, &mut bm, buf)?;
+
+        let (buf,evicted_pid) = bm.new_buffer(pid)?;
+        let mut page = self.pool[buf as usize].write().unwrap();
+        if evicted_pid != 0 {
+	    // dirty page was evicted
+	    self.file
+                .write_all_at(&mut page.data, evicted_pid as u64 * PAGE_SIZE as u64)?;
+	}
+        page.data.fill(0u8);
+        assert!(bm.modify_buffer(buf));
 
         Ok(PageGuard {
             buf,
-            pid: bm.pages[buf as usize].pid,
+            pid,
             storage: &self,
         })
     }
@@ -912,10 +1082,17 @@ impl Storage {
     // Read page in buffer and return PageGuard with pinned buffer.
     // Buffer will be automatically released on exiting from scope
     //
-    fn get_page(&self, pid: PageId, mode: AccessMode) -> Result<PageGuard<'_>> {
+    fn get_page(&self, pid: PageId) -> Result<PageGuard<'_>> {
         let mut bm = self.buf_mgr.lock().unwrap();
-        let buf = bm.get_buffer(pid)?;
-        if (bm.pages[buf as usize].state & PAGE_BUSY) != 0 {
+        let (buf,evicted_pid) = bm.get_buffer(pid)?;
+	let state = bm.pages[buf as usize].state;
+	if evicted_pid != 0 {
+	    // dirty page was evicted
+	    let page = self.pool[buf as usize].read().unwrap();
+	    self.file
+                .write_all_at(&page.data, evicted_pid as u64 * PAGE_SIZE as u64)?;
+	}
+        if (state & PAGE_BUSY) != 0 {
             // Some other thread is loading buffer: just wait until it done
             bm.pages[buf as usize].state |= PAGE_WAIT;
             loop {
@@ -928,56 +1105,26 @@ impl Storage {
                 }
             }
         } else if (bm.pages[buf as usize].state & PAGE_RAW) != 0 {
-            if mode != AccessMode::WriteOnly {
-                // Read buffer if not in write-only mode
-                bm.pages[buf as usize].state = PAGE_BUSY;
-                drop(bm); // read page without holding lock
-                {
-                    let mut page = self.pool[buf as usize].write().unwrap();
-                    self.file
-                        .read_exact_at(&mut page.data, pid as u64 * PAGE_SIZE as u64)?;
-                }
-                bm = self.buf_mgr.lock().unwrap();
-                if (bm.pages[buf as usize].state & PAGE_WAIT) != 0 {
-                    // Somebody is waiting for us
-                    self.busy_events[buf as usize % N_BUSY_EVENTS].notify_all();
-                }
+	    // Read page
+            bm.pages[buf as usize].state = PAGE_BUSY;
+            drop(bm); // read page without holding lock
+            {
+                let mut page = self.pool[buf as usize].write().unwrap();
+                self.file
+                    .read_exact_at(&mut page.data, pid as u64 * PAGE_SIZE as u64)?;
+            }
+            bm = self.buf_mgr.lock().unwrap();
+            if (bm.pages[buf as usize].state & PAGE_WAIT) != 0 {
+                // Somebody is waiting for us
+                self.busy_events[buf as usize % N_BUSY_EVENTS].notify_all();
             }
             bm.pages[buf as usize].state = 0;
-        }
-        if mode != AccessMode::ReadOnly {
-            bm.modify_buffer(buf, BufferId::MAX)?;
         }
         Ok(PageGuard {
             buf,
             pid,
             storage: &self,
         })
-    }
-
-    //
-    // Mark buffer as modified, pin it in memory and if it is needed,
-    // write least recently modified page to WAL
-    //
-    fn modify_buffer(
-        &self,
-        db: &mut Database,
-        bm: &mut BufferManager,
-        buf: BufferId,
-    ) -> Result<()> {
-        if let Some((sync_buf, sync_pid)) = bm.modify_buffer(buf, self.conf.wal_flush_threshold)? {
-            assert_eq!(bm.pages[sync_buf as usize].state, PAGE_DIRTY | PAGE_SYNCED);
-            self.write_page_to_wal(db, sync_buf, sync_pid)?;
-        }
-        Ok(())
-    }
-
-    //
-    // Mark page as dirty and pin it in-memory until end of transaction
-    //
-    fn modify_page(&self, db: &mut Database, buf: BufferId) -> Result<()> {
-        let mut bm = self.buf_mgr.lock().unwrap();
-        self.modify_buffer(db, &mut bm, buf)
     }
 
     pub fn start_transaction(&self) -> Transaction<'_> {
@@ -988,100 +1135,64 @@ impl Storage {
         }
     }
 
-    fn write_page_to_wal(&self, db: &mut Database, buf: BufferId, pid: PageId) -> Result<()> {
-        if let Some(log) = &self.log {
-            let mut tx_buf = [0u8; PAGE_SIZE + 4];
-            let page = self.pool[buf as usize].read().unwrap();
-            tx_buf[0..4].copy_from_slice(&pid.to_be_bytes());
-            tx_buf[4..].copy_from_slice(&page.data);
-            db.tx_crc = crc32c_append(db.tx_crc, &tx_buf);
-            log.write_all_at(&tx_buf, db.wal_pos)?;
-            db.wal_pos += (4 + PAGE_SIZE) as u64;
-            db.tx_size += 4 + PAGE_SIZE;
-        }
-        Ok(())
-    }
-
     fn commit(&self, db: &mut Database) -> Result<()> {
         let mut bm = self.buf_mgr.lock().unwrap();
+	assert!(bm.pinned == 1);
+        if !db.cow_map.is_empty() { // if something changed
+	    // First prepare deallocation...
+	    let mut pending_deletes: Vec<PageId> = Vec::new();
+	    std::mem::swap(&mut db.pending_deletes, &mut pending_deletes);
+	    for pg in &pending_deletes {
+		self.prepare_free_page(db, *pg)?;
+	    }
+	    // ... then actually do it
+	    let n_alloc_pages = db.n_alloc_pages;
+	    for pg in &pending_deletes {
+		self.free_page(db, *pg)?;
+	    }
+	    // Delete original pages (them should be already prepared)
+	    let mut cow_map: HashMap<PageId,PageId> = HashMap::new();
+	    std::mem::swap(&mut db.cow_map, &mut cow_map);
+	    for (_new,old) in &cow_map {
+		self.free_page(db, *old)?;
+	    }
+	    assert!(n_alloc_pages == db.n_alloc_pages); // no allocation should happen during deallocation
 
-        if db.meta_updated {
+	    self.flush_buffers(&mut bm)?;
+	    if !self.conf.nosync {
+		self.file.sync_all()?;
+	    }
+
             let meta = db.meta.pack();
             let mut page = self.pool[0].write().unwrap();
-            page.data[0..METADATA_SIZE].copy_from_slice(&meta);
-        }
-        if let Some(log) = &self.log {
-            // Write dirty pages to log file
-            let mut dirty = bm.dirty_pages;
-            while dirty != 0 && (bm.pages[dirty as usize].state & PAGE_SYNCED) == 0 {
-                assert_eq!(bm.pages[dirty as usize].state, PAGE_DIRTY);
-                self.write_page_to_wal(db, dirty, bm.pages[dirty as usize].pid)?;
-                dirty = bm.pages[dirty as usize].next;
-            }
-            if bm.dirty_pages != 0 {
-                let mut buf = [0u8; METADATA_SIZE + 8];
-                {
-                    let page = self.pool[0].read().unwrap();
-                    buf[4..4 + METADATA_SIZE].copy_from_slice(&page.data[0..METADATA_SIZE]);
-                }
-                let crc = crc32c_append(db.tx_crc, &buf[..4 + METADATA_SIZE]);
-                buf[4 + METADATA_SIZE..].copy_from_slice(&crc.to_be_bytes());
-                log.write_all_at(&buf, db.wal_pos)?;
-                db.wal_pos += (8 + METADATA_SIZE) as u64;
-                log.sync_all()?;
-                db.lsn += 1;
-                db.tx_crc = 0;
-                db.tx_size = 0;
+            page.data.copy_from_slice(&meta);
+            self.file.write_all_at(&page.data, 0)?;
+	    if !self.conf.nosync {
+		self.file.sync_all()?;
+	    }
 
-                // Write pages to the data file
-                self.flush_buffers(&mut bm, db.meta_updated)?;
-
-                if db.wal_pos >= self.conf.checkpoint_interval {
-                    // Sync data file and restart from the beginning of WAL.
-                    // So not truncate WAL to avoid file extension overhead.
-                    self.file.sync_all()?;
-                    db.wal_pos = 0;
-                }
-            }
-        } else {
-            // No WAL mode: just write dirty pages to the disk
-            if self.flush_buffers(&mut bm, db.meta_updated)? {
-                db.lsn += 1;
-            }
+            db.lsn += 1;
         }
-        db.meta_updated = false;
         Ok(())
     }
 
     //
-    // Flush dirty pages to the disk. Return true if database is changed.
+    // Flush dirty pages to the disk.
     //
-    fn flush_buffers(&self, bm: &mut BufferManager, save_meta: bool) -> Result<bool> {
-        let mut dirty = bm.dirty_pages;
-        if save_meta {
-            assert!(dirty != 0); // if we changed meta, then we should change or create at least one page
-            let page = self.pool[0].read().unwrap();
-            self.file.write_all_at(&page.data, 0)?;
-        }
+    fn flush_buffers(&self, bm: &mut BufferManager) -> Result<()> {
+        let mut dirty = bm.dirty_pages.next;
         while dirty != 0 {
-            let pid = bm.pages[dirty as usize].pid;
-            let file_offs = pid as u64 * PAGE_SIZE as u64;
-            let page = self.pool[dirty as usize].read().unwrap();
-            let next = bm.pages[dirty as usize].next;
-            self.file.write_all_at(&page.data, file_offs)?;
-            debug_assert!((bm.pages[dirty as usize].state & PAGE_DIRTY) != 0);
-            bm.pages[dirty as usize].state = 0;
-            bm.unpin(dirty);
-            dirty = next;
+	    let pid = bm.pages[dirty as usize].pid;
+	    let file_offs = pid as u64 * PAGE_SIZE as u64;
+	    let page = self.pool[dirty as usize].read().unwrap();
+	    self.file.write_all_at(&page.data, file_offs)?;
+	    debug_assert!((bm.pages[dirty as usize].state & PAGE_DIRTY) != 0);
+	    bm.pages[dirty as usize].state = 0;
+	    dirty = bm.pages[dirty as usize].list.next;
         }
-        if bm.dirty_pages != 0 {
-            bm.dirty_pages = 0;
-            bm.dirtied = 0;
-            bm.next_sync = 0;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        bm.dirty_pages.prune();
+        bm.dirtied = 0;
+	Ok(())
     }
 
     //
@@ -1089,30 +1200,34 @@ impl Storage {
     //
     fn rollback(&self, db: &mut Database) -> Result<()> {
         let mut bm = self.buf_mgr.lock().unwrap();
-        let mut dirty = bm.dirty_pages;
-        // Just throw away all dirty pages from buffer cache to force reloading of original pages
-        while dirty != 0 {
-            debug_assert!((bm.pages[dirty as usize].state & PAGE_DIRTY) != 0);
-            debug_assert!(bm.pages[dirty as usize].access_count == 1);
-            let next = bm.pages[dirty as usize].next;
-            bm.throw_buffer(dirty);
-            dirty = next;
-        }
-        bm.dirty_pages = 0;
-        bm.dirtied = 0;
-        bm.next_sync = 0;
-        db.wal_pos -= db.tx_size as u64;
-        db.tx_crc = 0;
-        db.tx_size = 0;
+	assert!(bm.pinned == 1);
+	if !db.cow_map.is_empty() {
+            let mut dirty = bm.dirty_pages.next;
+            // Just throw away all dirty pages from buffer cache to force reloading of original pages
+            while dirty != 0 {
+		debug_assert!((bm.pages[dirty as usize].state & PAGE_DIRTY) != 0);
+		bm.throw_buffer(dirty);
+		dirty = bm.pages[dirty as usize].list.next;
+            }
+            bm.dirty_pages.prune();
+            bm.dirtied = 0;
 
-        if db.meta_updated {
+	    // But it is not enough to throw away just dirty pages,
+	    // some modified pages can already be save on the disk.
+	    // So we have to do loop through COW map
+	    let mut cow_map: HashMap<PageId,PageId> = HashMap::new();
+	    std::mem::swap(&mut db.cow_map, &mut cow_map);
+	    for (new,_old) in &cow_map {
+		bm.forget_buffer(*new);
+	    }
+
             // reread metadata from disk
             let mut page = self.pool[0].write().unwrap();
             self.file.read_exact_at(&mut page.data, 0)?;
             db.meta = Metadata::unpack(&page.data);
-            db.meta_updated = false;
-        }
-        db.n_aborted_txns += 1;
+            db.n_aborted_txns += 1;
+	    db.pending_deletes.clear();
+	}
         Ok(())
     }
 
@@ -1121,7 +1236,7 @@ impl Storage {
     /// If path to transaction log is not specified, then WAL (write-ahead-log) is not used.
     /// It will significantly increase performance but can cause database corruption in case of power failure or system crash.
     ///
-    pub fn open(db_path: &Path, log_path: Option<&Path>, conf: StorageConfig) -> Result<Storage> {
+    pub fn open(db_path: &Path, conf: StorageConfig) -> Result<Storage> {
         let mut buf = [0u8; PAGE_SIZE];
         let (file, meta) = if let Ok(file) = OpenOptions::new().write(true).read(true).open(db_path)
         {
@@ -1142,36 +1257,23 @@ impl Storage {
             let meta = Metadata {
                 magic: MAGIC,
                 version: VERSION,
-                free: 0,
                 size: 1,
                 used: 1,
                 root: 0,
                 height: 0,
+		alloc_pages: [0u32; N_BITMAP_PAGES]
             };
             let metadata = meta.pack();
-            buf[0..METADATA_SIZE].copy_from_slice(&metadata);
+            buf.copy_from_slice(&metadata);
             file.write_all_at(&mut buf, 0)?;
             (file, meta)
-        };
-        let log = if let Some(path) = log_path {
-            let log = OpenOptions::new()
-                .write(true)
-                .read(true)
-                .create(true)
-                .open(path)?;
-            log.try_lock_exclusive()?;
-            Some(log)
-        } else {
-            None
         };
         let storage = Storage {
             busy_events: [(); N_BUSY_EVENTS].map(|_| Condvar::new()),
             buf_mgr: Mutex::new(BufferManager {
-                head: 0,
-                tail: 0,
+                lru: L2List::default(),
+                dirty_pages: L2List::default(),
                 free_pages: 0,
-                dirty_pages: 0,
-                next_sync: 0,
                 used: 1, // pinned root page
                 cached: 1,
                 pinned: 1,
@@ -1183,99 +1285,22 @@ impl Storage {
                 .take(conf.cache_size)
                 .collect(),
             file,
-            log,
-            conf,
+	    conf,
             db: RwLock::new(Database {
                 lsn: 0,
                 n_aborted_txns: 0,
                 meta,
-                meta_updated: false,
-                recovery: RecoveryStatus {
-                    ..Default::default()
-                },
-                state: DatabaseState::InRecovery,
-                wal_pos: 0,
-                tx_crc: 0,
-                tx_size: 0,
+                state: DatabaseState::Opened,
+		alloc_page: 0,
+		alloc_page_pos: 0,
+		cow_map: HashMap::new(),
+		pending_deletes: Vec::new(),
+		recursive_alloc: false,
+		n_alloc_pages: 0,
+		n_free_pages: 0,
             }),
         };
-        storage.recovery()?;
         Ok(storage)
-    }
-
-    //
-    // Recover database from WAL (if any)
-    //
-    fn recovery(&self) -> Result<()> {
-        let mut db = self.db.write().unwrap();
-        if let Some(log) = &self.log {
-            let mut buf = [0u8; 4];
-            let mut crc = 0u32;
-            let mut wal_pos = 0u64;
-            db.recovery.wal_size = log.metadata()?.len();
-            loop {
-                let len = log.read_at(&mut buf, wal_pos)?;
-                if len != 4 {
-                    // end of log
-                    break;
-                }
-                wal_pos += 4;
-                let pid = PageId::from_be_bytes(buf);
-                crc = crc32c_append(crc, &buf);
-                if pid != 0 {
-                    let pin = self.get_page(pid, AccessMode::WriteOnly)?;
-                    let mut page = self.pool[pin.buf as usize].write().unwrap();
-                    let len = log.read_at(&mut page.data, wal_pos)?;
-                    if len != PAGE_SIZE {
-                        break;
-                    }
-                    wal_pos += len as u64;
-                    crc = crc32c_append(crc, &page.data);
-                } else {
-                    let mut meta_buf = [0u8; METADATA_SIZE];
-                    let len = log.read_at(&mut meta_buf, wal_pos)?;
-                    if len != METADATA_SIZE {
-                        break;
-                    }
-                    wal_pos += len as u64;
-                    crc = crc32c_append(crc, &meta_buf);
-                    let len = log.read_at(&mut buf, wal_pos)?;
-                    if len != 4 {
-                        break;
-                    }
-                    wal_pos += 4;
-                    if u32::from_be_bytes(buf) != crc {
-                        // CRC mismatch
-                        break;
-                    }
-                    {
-                        let mut page = self.pool[0].write().unwrap();
-                        page.data[0..METADATA_SIZE].copy_from_slice(&meta_buf);
-                        db.meta_updated = true;
-                    }
-                    let mut bm = self.buf_mgr.lock().unwrap();
-                    self.flush_buffers(&mut bm, true)?;
-                    db.meta_updated = false;
-                    db.recovery.recovered_transactions += 1;
-                    db.recovery.recovery_end = wal_pos;
-                    crc = 0u32;
-                }
-            }
-            self.rollback(&mut db)?;
-
-            // reset WAL
-            self.file.sync_all()?;
-            db.wal_pos = 0;
-            log.set_len(0)?; // truncate log
-        }
-        // reread metadata
-        let mut page = self.pool[0].write().unwrap();
-        self.file.read_exact_at(&mut page.data, 0)?;
-        db.meta = Metadata::unpack(&page.data);
-
-        db.state = DatabaseState::Opened;
-
-        Ok(())
     }
 
     //
@@ -1364,12 +1389,12 @@ impl Storage {
     }
 
     //
-    // Remove key from B-Tree. Recursively traverse B-Tree and return true in case of underflow.
+    // Remove key from B-Tree. Returns ID of updated page or 0 in case of underflow
     // Right now we do not redistribute nodes between pages or merge pages, underflow is reported only if page becomes empty.
     // If key is not found, then nothing is performed and no error is reported.
     //
-    fn btree_remove(&self, db: &mut Database, pid: PageId, key: &Key, height: u32) -> Result<bool> {
-        let pin = self.get_page(pid, AccessMode::ReadOnly)?;
+    fn btree_remove(&self, db: &mut Database, pid: PageId, key: &Key, height: u32) -> Result<PageId> {
+        let mut pin = self.get_page(pid)?;
         let mut page = self.pool[pin.buf as usize].write().unwrap();
         let mut l: ItemPointer = 0;
         let n = page.get_n_items();
@@ -1386,27 +1411,26 @@ impl Storage {
         if height == 1 {
             // leaf page
             if r < n && page.compare_key(r, key) == Ordering::Equal {
-                self.modify_page(db, pin.buf)?;
+                pin.modify(db)?;
                 page.remove_key(r, true);
             }
         } else {
             // recurse to next level
             debug_assert!(r < n);
-            let underflow = self.btree_remove(db, page.get_child(r), key, height - 1)?;
-            if underflow {
-                self.modify_page(db, pin.buf)?;
+            let pid = self.btree_remove(db, page.get_child(r), key, height - 1)?;
+            pin.modify(db)?;
+            if pid == 0 {
                 page.remove_key(r, false);
-            }
+            } else {
+		page.set_child(r, pid);
+	    }
         }
         if page.get_n_items() == 0 {
             // free page
-            page.set_u32(0, db.meta.free);
-            db.meta.free = pid;
-            db.meta.used -= 1;
-            db.meta_updated = true;
-            Ok(true)
+	    db.pending_deletes.push(pid);
+            Ok(0)
         } else {
-            Ok(false)
+            Ok(pin.pid)
         }
     }
 
@@ -1420,8 +1444,8 @@ impl Storage {
         key: &Key,
         value: &Value,
         height: u32,
-    ) -> Result<Option<(Key, PageId)>> {
-        let pin = self.get_page(pid, AccessMode::ReadOnly)?;
+    ) -> Result<(PageId, Option<(Key, PageId)>)> {
+        let mut pin = self.get_page(pid)?;
         let mut page = self.pool[pin.buf as usize].write().unwrap();
         let mut l: ItemPointer = 0;
         let n = page.get_n_items();
@@ -1437,23 +1461,24 @@ impl Storage {
         debug_assert!(l == r);
         if height == 1 {
             // leaf page
-            self.modify_page(db, pin.buf)?;
+            pin.modify(db)?;
             if r < n && page.compare_key(r, key) == Ordering::Equal {
                 // replace old value with new one: just remove old one and reinsert new key-value pair
                 page.remove_key(r, true);
             }
-            self.btree_insert_in_page(db, &mut page, r, key, value)
+            Ok((pin.pid, self.btree_insert_in_page(db, &mut page, r, key, value)?))
         } else {
             // recurse to next level
             debug_assert!(r < n);
-            let overflow = self.btree_insert(db, page.get_child(r), key, value, height - 1)?;
+            let (child, overflow) = self.btree_insert(db, page.get_child(r), key, value, height - 1)?;
+            pin.modify(db)?;
+	    page.set_child(r, child);
             if let Some((key, child)) = overflow {
                 // insert new page before original
-                self.modify_page(db, pin.buf)?;
                 debug_assert!(child != 0);
-                self.btree_insert_in_page(db, &mut page, r, &key, &child.to_be_bytes().to_vec())
+                Ok((pin.pid, self.btree_insert_in_page(db, &mut page, r, &key, &child.to_be_bytes().to_vec())?))
             } else {
-                Ok(None)
+                Ok((pin.pid, None))
             }
         }
     }
@@ -1466,14 +1491,14 @@ impl Storage {
         if db.meta.root == 0 {
             db.meta.root = self.btree_allocate_leaf_page(db, key, value)?;
             db.meta.height = 1;
-            db.meta_updated = true;
-        } else if let Some((key, page)) =
-            self.btree_insert(db, db.meta.root, key, value, db.meta.height)?
-        {
-            // overflow
-            db.meta.root = self.btree_allocate_internal_page(db, &key, page, db.meta.root)?;
-            db.meta.height += 1;
-            db.meta_updated = true;
+        } else {
+	    let (new_root, overflow) = self.btree_insert(db, db.meta.root, key, value, db.meta.height)?;
+	    if let Some((key, page)) = overflow {
+		db.meta.root = self.btree_allocate_internal_page(db, &key, page, new_root)?;
+		db.meta.height += 1;
+	    } else {
+		db.meta.root = new_root;
+	    }
         }
         Ok(())
     }
@@ -1483,12 +1508,12 @@ impl Storage {
     //
     fn do_remove(&self, db: &mut Database, key: &Key) -> Result<()> {
         if db.meta.root != 0 {
-            let underflow = self.btree_remove(db, db.meta.root, key, db.meta.height)?;
-            if underflow {
+            let new_root = self.btree_remove(db, db.meta.root, key, db.meta.height)?;
+            db.meta.root = new_root;
+            if new_root == 0 {
+		// underflow
                 db.meta.height = 0;
-                db.meta.root = 0;
-                db.meta_updated = true;
-            }
+	    }
         }
         Ok(())
     }
@@ -1511,7 +1536,7 @@ impl Storage {
                 if pid != 0 {
                     let mut level = db.meta.height;
                     loop {
-                        let pin = self.get_page(pid, AccessMode::ReadOnly)?;
+                        let pin = self.get_page(pid)?;
                         let page = self.pool[pin.buf as usize].read().unwrap();
                         path.stack.push(PagePos { pid, pos: 0 });
                         level -= 1;
@@ -1531,7 +1556,7 @@ impl Storage {
                 if pid != 0 {
                     let mut level = db.meta.height;
                     loop {
-                        let pin = self.get_page(pid, AccessMode::ReadOnly)?;
+                        let pin = self.get_page(pid)?;
                         let page = self.pool[pin.buf as usize].read().unwrap();
                         let pos = page.get_n_items() - 1;
                         level -= 1;
@@ -1582,7 +1607,7 @@ impl Storage {
     // reset path and returns false otherwise.
     //
     fn find(&self, pid: PageId, path: &mut TreePath, key: &Key, height: u32) -> Result<bool> {
-        let pin = self.get_page(pid, AccessMode::ReadOnly)?;
+        let pin = self.get_page(pid)?;
         let page = self.pool[pin.buf as usize].read().unwrap();
         let n = page.get_n_items();
         let mut l: ItemPointer = 0;
@@ -1655,7 +1680,7 @@ impl Storage {
         path.curr = None;
         while !path.stack.is_empty() {
             let top = path.stack.pop().unwrap();
-            let pin = self.get_page(top.pid, AccessMode::ReadOnly)?;
+            let pin = self.get_page(top.pid)?;
             let page = self.pool[pin.buf as usize].read().unwrap();
             let n_items = page.get_n_items();
             let pos = top.pos + inc;
@@ -1692,7 +1717,7 @@ impl Storage {
         path.curr = None;
         while !path.stack.is_empty() {
             let top = path.stack.pop().unwrap();
-            let pin = self.get_page(top.pid, AccessMode::ReadOnly)?;
+            let pin = self.get_page(top.pid)?;
             let page = self.pool[pin.buf as usize].read().unwrap();
             let pos = if top.pos == usize::MAX {
                 page.get_n_items()
@@ -1719,7 +1744,7 @@ impl Storage {
     }
 
     fn traverse(&self, pid: PageId, prev_key: &mut Key, height: u32) -> Result<u64> {
-        let pin = self.get_page(pid, AccessMode::ReadOnly)?;
+        let pin = self.get_page(pid)?;
         let page = self.pool[pin.buf as usize].read().unwrap();
         let n_items = page.get_n_items();
         let mut count = 0u64;
@@ -1898,17 +1923,12 @@ impl Storage {
                 let mut delayed_commit = false;
                 if let Ok(bm) = self.buf_mgr.lock() {
                     // avoid poisoned mutex
-                    if bm.dirty_pages != 0 {
+                    if bm.dirty_pages.next != 0 {
                         delayed_commit = true;
                     }
                 }
                 if delayed_commit {
                     self.commit(&mut db)?;
-                }
-                // Sync data file and truncate log in case of normal shutdown
-                self.file.sync_all()?;
-                if let Some(log) = &self.log {
-                    log.set_len(0)?; // truncate WAL
                 }
                 db.state = DatabaseState::Closed;
             }
@@ -1924,14 +1944,6 @@ impl Storage {
         ensure!(db.state == DatabaseState::Opened);
         db.state = DatabaseState::Closed;
         Ok(())
-    }
-
-    ///
-    /// Get recovery status
-    ///
-    pub fn get_recovery_status(&self) -> RecoveryStatus {
-        let db = self.db.read().unwrap();
-        db.recovery
     }
 
     ///
