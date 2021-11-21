@@ -383,13 +383,11 @@ fn test_acid() {
 
 #[test]
 fn test_recovery() {
-    let data_path = Path::new("test11.dbs");
+    let data_path = "test11.dbs";
     const N_KEYS: u64 = 100000;
     {
         let _ = std::fs::remove_file(&data_path);
-        let mut cfg = StorageConfig::default();
-        cfg.wal_flush_threshold = 1;
-        let store = Storage::open(data_path, false, cfg).unwrap();
+        let store = open_store(data_path, false);
         {
             let mut trans = store.start_transaction();
             for key in 0..N_KEYS {
@@ -411,13 +409,9 @@ fn test_recovery() {
             }
             // transaction shoud be implicitly aborted
         }
-        store.shutdown().unwrap(); // do not truncate WAL
     }
     {
-        let store = Storage::open(data_path, false, StorageConfig::default()).unwrap();
-        let recovery = store.get_recovery_status();
-        assert_eq!(recovery.recovered_transactions, 2);
-        assert!(recovery.wal_size > recovery.recovery_end);
+        let store = reopen_store(data_path, false);
         for key in 0..N_KEYS {
             assert_eq!(store.get(&pack(key)).unwrap().unwrap(), v(b"two"));
         }
@@ -441,7 +435,7 @@ fn do_selects(s: Arc<Storage>, n_records: usize) {
 
 #[test]
 fn test_parallel_access() {
-    let store = Arc::new(open_store("test1.dbs", None));
+    let store = Arc::new(open_store("test1.dbs", true));
     let n_writers = 10u32;
     let n_records = 10000u32;
     let mut threads = Vec::new();
