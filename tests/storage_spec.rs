@@ -13,6 +13,7 @@ use yakv::storage::*;
 const RAND_SEED: u64 = 2021;
 const N_RECORDS_LARGE: usize = 1000000;
 const N_RECORDS_SMALL: usize = 10000;
+const TRANS_SIZE: usize = 10000;
 
 #[test]
 fn test_basic_ops() {
@@ -300,7 +301,7 @@ fn rnd_benchmark(
 
 #[test]
 fn seq_benchmark_sync_large_trans() {
-    assert!(seq_benchmark("test2.dbs", false, N_RECORDS_LARGE, 1000,).is_ok());
+    assert!(seq_benchmark("test2.dbs", false, N_RECORDS_LARGE, TRANS_SIZE,).is_ok());
 }
 
 #[test]
@@ -310,7 +311,7 @@ fn seq_benchmark_sync_small_trans() {
 
 #[test]
 fn seq_benchmark_nosync_large_trans() {
-    assert!(seq_benchmark("test4.dbs", true, N_RECORDS_LARGE, 1000,).is_ok());
+    assert!(seq_benchmark("test4.dbs", true, N_RECORDS_LARGE, TRANS_SIZE,).is_ok());
 }
 
 #[test]
@@ -320,7 +321,7 @@ fn seq_benchmark_nosync_small_trans() {
 
 #[test]
 fn rnd_benchmark_sync_large_trans() {
-    assert!(rnd_benchmark("test6.dbs", false, N_RECORDS_LARGE, 1000,).is_ok());
+    assert!(rnd_benchmark("test6.dbs", false, N_RECORDS_LARGE, TRANS_SIZE,).is_ok());
 }
 
 #[test]
@@ -330,7 +331,7 @@ fn rnd_benchmark_sync_small_trans() {
 
 #[test]
 fn rnd_benchmark_nosync_large_trans() {
-    assert!(rnd_benchmark("test8.dbs", true, N_RECORDS_LARGE, 1000,).is_ok());
+    assert!(rnd_benchmark("test8.dbs", true, N_RECORDS_LARGE, TRANS_SIZE,).is_ok());
 }
 
 #[test]

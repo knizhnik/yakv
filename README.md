@@ -1,5 +1,5 @@
 **YAKV** is very simple persistent-key value storage implemented in Rust
-using "traditional" architecture: B-Tree, buffer cache, ACID transaction, write-ahead log.
+using "traditional" architecture: B-Tree, buffer cache, ACID transactions based on copy-on-write.
 **YAKV** implements simple MURSIW (multiple-reads-single-writer) access pattern
 and is first of all oriented on embedded applications.
 
@@ -31,16 +31,16 @@ For example for unsigned integer types you need to use _big-endian_ encoding (i.
 to make vector of bytes comparison produce the same result as comparison of two numbers.
 For signed or floating point types writing such serializer may require more efforts.
 
-**YAKV** optionally keeps write ahead log (WAL) to provide ACID.
-Maintaining WAL requires `fsync` system calls to force persisting data to the non-volatile media.
-Add add significant performance penalty especially for small transaction as (inserting just one pair).
-But without WAL database can be corrupted in case of abnormal program termination or power failure.
-To disable WAL just pass `None` instead of WAL file path.
+**YAKV** uses copy-on-write (COW) mechanism to provide atomic transactions.
+To guarantee durability and consincy of committed data, it performs two `fsync` system calls on each commit.
+It adds significant performance penalty especially for small transaction as (inserting just one pair).
+But without fsync database can be corrupted in case of abnormal program termination or power failure.
+To disable fsync, set `nosync=true` in config.
 
 Below is an example of **YAKV** usage":
 
 ```
-let store = Storage::open(data_path, Some(log_path), StorageConfig::default())?;
+let store = Storage::open(data_path, StorageConfig::default())?;
 
 // Simple insert/update:
 let key = b"Some key".to_vec();
@@ -137,14 +137,13 @@ Performance dependency on transaction size (LMDB vs. YAKV or COW vs. WAL).
 This benchmark inserts 1M random keys (as in LMDB benchmark),
 but inserts are grouped in transactions (time in msec):
 
-| tx size |  yakv  |  LMDB  |
-| ------- | ------ | ------ |
-| 1000000 |   1543 |   1367 |
-| 100000  |   3914 |   3022 |
-| 10000   |  16384 |   8139 |
-| 1000    |  30944 |  16881 |
-| 100     |  85268 |  70775 |
-| 10      | 192179 | 229538 |
+| tx size |  yakv(WAL) |  yakv(COW) |  LMDB  |
+| ------- | ---------- | ---------- | ------ |
+| 1000000 |       2252 |       1626 |   1853 |
+| 100000  |       5860 |       3941 |   4709 |
+| 10000   |      29285 |      17989 |  15718 |
+| 1000    |      73223 |      54388 |  30050 |
+| 100     |     131826 |     123618 |  83233 |
 
-So for large transactions LMDB is slightly faster, for small transactions YAKV is faster
+So for large transactions LMDB is slightly faster, for small transactions YAKV with WAL is faster
 and for medium size transactions LMDB is about two times faster than YAKV.
