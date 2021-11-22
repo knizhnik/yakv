@@ -101,6 +101,15 @@ fn test_basic_ops() {
             .collect::<Vec<(Key, Value)>>(),
         [(v(b"2"), v(b"two-two")), (v(b"4"), v(b"four"))]
     );
+    drop(store);
+    let store = reopen_store("test1.dbs", false);
+    assert_eq!(
+        store
+            .range(v(b"2")..v(b"5"))
+            .flatten()
+            .collect::<Vec<(Key, Value)>>(),
+        [(v(b"2"), v(b"two-two")), (v(b"4"), v(b"four"))]
+    );
 }
 
 fn seq_benchmark(

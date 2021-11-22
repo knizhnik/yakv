@@ -380,6 +380,7 @@ struct Database {
     pending_deletes: Vec<PageId>, // we can no immedately delete pages, because deleted page can be reused and can not be stored in `cow` map
     n_alloc_pages: u64,           // number of allocated pages since session start
     n_free_pages: u64,            // number of deallocated pages since session start
+    modified: bool,               // database was modified by current transaction
 }
 
 impl Database {
@@ -518,7 +519,7 @@ impl PageData {
         let bytes = self.data;
         for i in offs..PAGE_SIZE {
             if bytes[i] != 0xFFu8 {
-                return i * 8 + bytes[i].leading_ones() as usize;
+                return i * 8 + bytes[i].trailing_ones() as usize;
             }
         }
         usize::MAX
@@ -887,6 +888,10 @@ impl<'a> PageGuard<'a> {
                     .lock()
                     .unwrap()
                     .copy_on_write(self.buf, new_pid);
+                // Prevent infinite recursion
+                if db.meta.alloc_pages[db.alloc_page] == old_pid {
+                    db.meta.alloc_pages[db.alloc_page] = new_pid;
+                }
                 self.storage.prepare_free_page(db, old_pid)?; // prepare deallocation of original page
             }
         }
@@ -909,10 +914,11 @@ impl Storage {
     //
     fn allocate_page(&self, db: &mut Database) -> Result<PageId> {
         db.n_alloc_pages += 1;
+        db.modified = true;
         //
-        // Cyclic scan of bitmap pages. We start with position pointed by (alloca_page,alloc_page_pos)
+        // Cyclic scan of bitmap pages. We start with position pointed by (alloc_page,alloc_page_pos)
         // and continue iteration until we hole or reach end of bitmap.
-        // In the last case we restart scanning from the beginning but if not hole is found on this pass,
+        // In the last case we restart scanning from the beginning but if hole is not found on this pass,
         // then append new bitmap page
         //
         let mut first_pass = true;
@@ -923,7 +929,7 @@ impl Storage {
             if bp == 0 {
                 // bitmap page doesn't exists
                 if first_pass && db.alloc_page != 0 {
-                    // restart search from the beginning
+                    // restart scan from the beginning
                     db.alloc_page = 0;
                     first_pass = false;
                     continue;
@@ -932,7 +938,6 @@ impl Storage {
                 bp = db.meta.size;
                 db.meta.size += 1;
                 pin = self.new_page_at(bp)?;
-                self.mark_page(db, bp)?;
                 db.meta.alloc_pages[db.alloc_page] = pin.pid;
                 if db.alloc_page == 0 {
                     // Ininialize first bitmap page: we need to mark root page as occupied
@@ -941,6 +946,7 @@ impl Storage {
                         .unwrap()
                         .test_and_set_bit(0));
                 }
+                self.mark_page(db, bp)?;
             } else {
                 // Open existed bitmap page
                 pin = self.get_page(bp)?;
@@ -972,7 +978,8 @@ impl Storage {
                 db.alloc_page += 1;
                 if db.alloc_page == N_BITMAP_PAGES {
                     ensure!(first_pass); // OOM detection
-                                         // Restart scanning from the beginning
+
+                    // Restart scanning from the beginning
                     db.alloc_page = 0;
                     first_pass = false;
                 }
@@ -1127,10 +1134,9 @@ impl Storage {
     }
 
     fn commit(&self, db: &mut Database) -> Result<()> {
-        let mut bm = self.buf_mgr.lock().unwrap();
-        assert!(bm.pinned == 1);
-        if !db.cow_map.is_empty() {
-            // If something changed
+        assert!(self.buf_mgr.lock().unwrap().pinned == 1);
+        // Check if something was changed
+        if db.modified {
             // First prepare deallocation...
             let mut pending_deletes: Vec<PageId> = Vec::new();
             std::mem::swap(&mut db.pending_deletes, &mut pending_deletes);
@@ -1150,7 +1156,7 @@ impl Storage {
             }
             assert!(n_alloc_pages == db.n_alloc_pages); // no allocation should happen during deallocation
 
-            self.flush_buffers(&mut bm)?;
+            self.flush_buffers()?;
             if !self.conf.nosync {
                 self.file.sync_all()?;
             }
@@ -1162,6 +1168,7 @@ impl Storage {
             }
 
             db.lsn += 1;
+            db.modified = false;
         }
         Ok(())
     }
@@ -1169,7 +1176,8 @@ impl Storage {
     //
     // Flush dirty pages to the disk.
     //
-    fn flush_buffers(&self, bm: &mut BufferManager) -> Result<()> {
+    fn flush_buffers(&self) -> Result<()> {
+        let bm: &mut BufferManager = &mut self.buf_mgr.lock().unwrap();
         for bp in &bm.dirty_buffers {
             let buf = *bp as usize;
             let pid = bm.buffers[buf].pid;
@@ -1189,7 +1197,7 @@ impl Storage {
     fn rollback(&self, db: &mut Database) -> Result<()> {
         let mut bm = self.buf_mgr.lock().unwrap();
         assert!(bm.pinned == 1);
-        if !db.cow_map.is_empty() {
+        if db.modified {
             // Just throw away all dirty buffers from buffer cache to force reloading of original pages
             for i in 0..bm.dirty_buffers.len() {
                 let buf = bm.dirty_buffers[i];
@@ -1213,6 +1221,7 @@ impl Storage {
             db.meta = Metadata::unpack(&page.data);
             db.n_aborted_txns += 1;
             db.pending_deletes.clear();
+            db.modified = false;
         }
         Ok(())
     }
@@ -1281,6 +1290,7 @@ impl Storage {
                 pending_deletes: Vec::new(),
                 n_alloc_pages: 0,
                 n_free_pages: 0,
+                modified: false,
             }),
         };
         Ok(storage)
@@ -1424,7 +1434,7 @@ impl Storage {
     }
 
     //
-    // Insert item in B-Tree. Recursively traverse B-Tree and return position of new page in case of overflow.
+    // Insert item in B-Tree. Recursively traverse B-Tree and return new page id and position of new page in case of overflow.
     //
     fn btree_insert(
         &self,
@@ -1923,7 +1933,8 @@ impl Storage {
         if let Ok(mut db) = self.db.write() {
             // avoid poisoned lock
             if db.state == DatabaseState::Opened {
-                if !db.cow_map.is_empty() {
+                // Complete delayed commit
+                if db.modified {
                     self.commit(&mut db)?;
                 }
                 db.state = DatabaseState::Closed;
