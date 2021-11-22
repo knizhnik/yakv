@@ -762,6 +762,7 @@ impl BufferManager {
         debug_assert!(self.buffers[id as usize].access_count > 0);
         if (self.buffers[id as usize].state & PAGE_DIRTY) == 0 {
             self.buffers[id as usize].state = PAGE_DIRTY;
+            self.buffers[id as usize].dirty_index = self.dirty_buffers.len() as BufferId;
             self.dirty_buffers.push(id);
             true
         } else {
@@ -827,7 +828,7 @@ impl BufferManager {
             self.buffers[buf as usize].state = 0;
         } else {
             buf = self.used;
-            if (buf as usize) < self.hash_table.len() {
+            if (buf as usize) < self.buffers.len() {
                 self.used += 1;
                 self.cached += 1;
                 self.pinned += 1;
@@ -871,7 +872,7 @@ impl<'a> PageGuard<'a> {
     //
     // Copy on write page
     //
-    fn modify(&mut self, db: &mut Database) -> Result<()> {
+    fn modify(&mut self, db: &mut Database, bitmap_page: Option<usize>) -> Result<()> {
         let mut bm = self.storage.buf_mgr.lock().unwrap();
         if bm.modify_buffer(self.buf) {
             // first update of the page
@@ -889,8 +890,8 @@ impl<'a> PageGuard<'a> {
                     .unwrap()
                     .copy_on_write(self.buf, new_pid);
                 // Prevent infinite recursion
-                if db.meta.alloc_pages[db.alloc_page] == old_pid {
-                    db.meta.alloc_pages[db.alloc_page] = new_pid;
+                if let Some(alloc_page) = bitmap_page {
+                    db.meta.alloc_pages[alloc_page] = new_pid;
                 }
                 self.storage.prepare_free_page(db, old_pid)?; // prepare deallocation of original page
             }
@@ -957,8 +958,7 @@ impl Storage {
                 .find_first_zero_bit(db.alloc_page_pos);
             if bit != usize::MAX {
                 // hole located
-                pin.modify(db)?;
-                db.meta.alloc_pages[db.alloc_page] = pin.pid;
+                pin.modify(db, Some(db.alloc_page))?;
 
                 // Copying of allocator's pages can occupy hole we have found,
                 // so we need first to check if it is still available
@@ -968,6 +968,9 @@ impl Storage {
                     .test_and_set_bit(bit)
                 {
                     let pid = (db.alloc_page * ALLOC_BITMAP_SIZE + bit) as PageId;
+                    if pid >= db.meta.size {
+                        db.meta.size = pid + 1;
+                    }
                     db.alloc_page_pos = bit / 8;
                     db.meta.used += 1;
                     return Ok(pid);
@@ -992,8 +995,7 @@ impl Storage {
         let bit = pid as usize % ALLOC_BITMAP_SIZE;
         let bp = db.meta.alloc_pages[alloc_page];
         let mut pin = self.get_page(bp)?;
-        pin.modify(db)?;
-        db.meta.alloc_pages[alloc_page] = pin.pid;
+        pin.modify(db, Some(alloc_page))?;
 
         match op {
             BitmapOp::Probe => {
@@ -1410,14 +1412,14 @@ impl Storage {
         if height == 1 {
             // leaf page
             if r < n && page.compare_key(r, key) == Ordering::Equal {
-                pin.modify(db)?;
+                pin.modify(db, None)?;
                 page.remove_key(r, true);
             }
         } else {
             // recurse to next level
             debug_assert!(r < n);
             let pid = self.btree_remove(db, page.get_child(r), key, height - 1)?;
-            pin.modify(db)?;
+            pin.modify(db, None)?;
             if pid == 0 {
                 page.remove_key(r, false);
             } else {
@@ -1460,7 +1462,7 @@ impl Storage {
         debug_assert!(l == r);
         if height == 1 {
             // leaf page
-            pin.modify(db)?;
+            pin.modify(db, None)?;
             if r < n && page.compare_key(r, key) == Ordering::Equal {
                 // replace old value with new one: just remove old one and reinsert new key-value pair
                 page.remove_key(r, true);
@@ -1474,7 +1476,7 @@ impl Storage {
             debug_assert!(r < n);
             let (child, overflow) =
                 self.btree_insert(db, page.get_child(r), key, value, height - 1)?;
-            pin.modify(db)?;
+            pin.modify(db, None)?;
             page.set_child(r, child);
             if let Some((key, child)) = overflow {
                 // insert new page before original
