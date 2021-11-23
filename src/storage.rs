@@ -63,7 +63,7 @@ pub enum DatabaseState {
 // Operations with alloactor bitmap
 //
 enum BitmapOp {
-    Probe,
+    Prepare,
     Set,
     Clear,
 }
@@ -499,6 +499,10 @@ impl PageData {
 
     fn get_u32(&self, offs: usize) -> u32 {
         u32::from_be_bytes(self.data[offs..offs + 4].try_into().unwrap())
+    }
+
+    fn test_bit(&self, bit: usize) -> bool {
+        (self.data[bit >> 3] & (1 << (bit & 7))) != 0
     }
 
     fn test_and_set_bit(&mut self, bit: usize) -> bool {
@@ -938,10 +942,10 @@ impl Storage {
                 // Allocate bitmap page at the end of database
                 bp = db.meta.size;
                 db.meta.size += 1;
-                pin = self.new_page_at(bp)?;
+                pin = self.new_page_at(db, bp)?;
                 db.meta.alloc_pages[db.alloc_page] = pin.pid;
                 if db.alloc_page == 0 {
-                    // Ininialize first bitmap page: we need to mark root page as occupied
+                    // Initialize first bitmap page: we need to mark root page as occupied
                     assert!(self.pool[pin.buf as usize]
                         .write()
                         .unwrap()
@@ -990,6 +994,14 @@ impl Storage {
         }
     }
 
+    fn test_allocator_bitmap(&self, db: &Database, pid: PageId) -> Result<bool> {
+        let alloc_page = pid as usize / ALLOC_BITMAP_SIZE;
+        let bit = pid as usize % ALLOC_BITMAP_SIZE;
+        let bp = db.meta.alloc_pages[alloc_page];
+        let pin = self.get_page(bp)?;
+        Ok(self.pool[pin.buf as usize].read().unwrap().test_bit(bit))
+    }
+
     fn update_allocator_bitmap(&self, db: &mut Database, pid: PageId, op: BitmapOp) -> Result<()> {
         let alloc_page = pid as usize / ALLOC_BITMAP_SIZE;
         let bit = pid as usize % ALLOC_BITMAP_SIZE;
@@ -998,7 +1010,7 @@ impl Storage {
         pin.modify(db, Some(alloc_page))?;
 
         match op {
-            BitmapOp::Probe => {
+            BitmapOp::Prepare => {
                 // All allocator pages related to this pid are copied: we are ready to perform free operation
             }
             BitmapOp::Set => {
@@ -1026,7 +1038,7 @@ impl Storage {
     // deallocation, enforcing copying of all affected allocator's pages.
     //
     fn prepare_free_page(&self, db: &mut Database, pid: PageId) -> Result<()> {
-        self.update_allocator_bitmap(db, pid, BitmapOp::Probe)
+        self.update_allocator_bitmap(db, pid, BitmapOp::Prepare)
     }
 
     fn mark_page(&self, db: &mut Database, pid: PageId) -> Result<()> {
@@ -1052,13 +1064,16 @@ impl Storage {
     // Allocate new page in storage and get buffer for it
     //
     fn new_page(&self, db: &mut Database) -> Result<PageGuard<'_>> {
-        self.new_page_at(self.allocate_page(db)?)
+        let pid = self.allocate_page(db)?;
+        self.new_page_at(db, pid)
     }
 
     //
     // Allocate buffer for new page
     //
-    fn new_page_at(&self, pid: PageId) -> Result<PageGuard<'_>> {
+    fn new_page_at(&self, db: &mut Database, pid: PageId) -> Result<PageGuard<'_>> {
+        db.cow_map.insert(pid, 0); // remember new page in COW map to avoid its cloning
+
         let mut bm = self.buf_mgr.lock().unwrap();
 
         let (buf, evicted_pid) = bm.new_buffer(pid)?;
@@ -1151,11 +1166,16 @@ impl Storage {
                 self.free_page(db, *pg)?;
             }
             // Delete original pages (them should be already prepared)
-            let mut cow_map: HashMap<PageId, PageId> = HashMap::new();
-            std::mem::swap(&mut db.cow_map, &mut cow_map);
-            for (_new, old) in &cow_map {
-                self.free_page(db, *old)?;
+            let orig: Vec<PageId> = db
+                .cow_map
+                .iter()
+                .map(|(_new, old)| *old)
+                .filter(|pid| *pid != 0)
+                .collect();
+            for pid in orig {
+                self.free_page(db, pid)?;
             }
+            db.cow_map.clear();
             assert!(n_alloc_pages == db.n_alloc_pages); // no allocation should happen during deallocation
 
             self.flush_buffers()?;
@@ -1758,7 +1778,8 @@ impl Storage {
         Ok(())
     }
 
-    fn traverse(&self, pid: PageId, prev_key: &mut Key, height: u32) -> Result<u64> {
+    fn traverse(&self, db: &Database, pid: PageId, prev_key: &mut Key, height: u32) -> Result<u64> {
+        ensure!(self.test_allocator_bitmap(db, pid)?);
         let pin = self.get_page(pid)?;
         let page = self.pool[pin.buf as usize].read().unwrap();
         let n_items = page.get_n_items();
@@ -1771,7 +1792,7 @@ impl Storage {
             count += n_items as u64;
         } else {
             for i in 0..n_items {
-                count += self.traverse(page.get_child(i), prev_key, height - 1)?;
+                count += self.traverse(db, page.get_child(i), prev_key, height - 1)?;
                 let ord = page.compare_key(i, prev_key);
                 ensure!(ord == Ordering::Less || ord == Ordering::Equal);
             }
@@ -1819,9 +1840,15 @@ impl Storage {
     pub fn verify(&self) -> Result<u64> {
         let db = self.db.read().unwrap();
         ensure!(db.state == DatabaseState::Opened);
+        ensure!(self.test_allocator_bitmap(&db, 0)?);
+        for pid in db.meta.alloc_pages {
+            if pid != 0 {
+                ensure!(self.test_allocator_bitmap(&db, pid)?);
+            }
+        }
         if db.meta.root != 0 {
             let mut prev_key = Vec::new();
-            self.traverse(db.meta.root, &mut prev_key, db.meta.height)
+            self.traverse(&db, db.meta.root, &mut prev_key, db.meta.height)
         } else {
             Ok(0)
         }
@@ -2093,19 +2120,6 @@ impl<'a> Transaction<'_> {
             till: range.end_bound().cloned(),
             left: TreePath::new(),
             right: TreePath::new(),
-        }
-    }
-    ///
-    /// Traverse B-Tree, check B-Tree invariants and return total number of keys in B-Tree
-    ///
-    pub fn verify(&self) -> Result<u64> {
-        ensure!(self.status == TransactionStatus::InProgress);
-        if self.db.meta.root != 0 {
-            let mut prev_key = Vec::new();
-            self.storage
-                .traverse(self.db.meta.root, &mut prev_key, self.db.meta.height)
-        } else {
-            Ok(0)
         }
     }
 
