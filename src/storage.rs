@@ -31,7 +31,7 @@ pub type Value = Vec<u8>;
 const PAGE_SIZE: usize = 8192;
 const MAGIC: u32 = 0xBACE2021;
 const VERSION: u32 = 1;
-const N_BITMAP_PAGES: usize = PAGE_SIZE / 4 - 6; // number of memory allocator bitmap pages
+const N_BITMAP_PAGES: usize = PAGE_SIZE / 4 - 8; // number of memory allocator bitmap pages
 const ALLOC_BITMAP_SIZE: usize = PAGE_SIZE * 8; // number of pages mapped by one allocator bitmap page
 const PAGE_HEADER_SIZE: usize = 2; // now page header contains just number of items in the page
 const MAX_VALUE_LEN: usize = PAGE_SIZE / 4; // assume that pages may fit at least 3 items
@@ -50,13 +50,6 @@ enum LookupOp<'a> {
     Next,
     Prev,
     GreaterOrEqual(&'a Key),
-}
-
-#[derive(PartialEq, Copy, Clone, Debug)]
-pub enum DatabaseState {
-    Opened,
-    Closed,
-    Corrupted,
 }
 
 //
@@ -127,8 +120,6 @@ pub struct DatabaseInfo {
     pub n_alloc_pages: u64,
     /// Number of deallocated pages since session start
     pub n_free_pages: u64,
-    /// State of the database
-    pub state: DatabaseState,
 }
 
 ///
@@ -186,26 +177,26 @@ impl TreePath {
 }
 
 impl<'a> StorageIterator<'a> {
-    fn next_locked(&mut self, db: &Database) -> Option<<StorageIterator<'a> as Iterator>::Item> {
-        if self.left.stack.len() == 0 {
+    fn next_locked(&mut self, meta: &Metadata) -> Option<<StorageIterator<'a> as Iterator>::Item> {
+        if self.left.stack.is_empty() {
             match &self.from {
                 Bound::Included(key) => {
                     self.storage
-                        .lookup(db, LookupOp::GreaterOrEqual(key), &mut self.left)
+                        .lookup(meta, LookupOp::GreaterOrEqual(key), &mut self.left)
                 }
                 Bound::Excluded(key) => {
                     self.storage
-                        .lookup(db, LookupOp::GreaterOrEqual(key), &mut self.left);
+                        .lookup(meta, LookupOp::GreaterOrEqual(key), &mut self.left);
                     if let Some((curr_key, _value)) = &self.left.curr {
                         if curr_key == key {
-                            self.storage.lookup(db, LookupOp::Next, &mut self.left);
+                            self.storage.lookup(meta, LookupOp::Next, &mut self.left);
                         }
                     }
                 }
-                Bound::Unbounded => self.storage.lookup(db, LookupOp::First, &mut self.left),
+                Bound::Unbounded => self.storage.lookup(meta, LookupOp::First, &mut self.left),
             }
         } else {
-            self.storage.lookup(db, LookupOp::Next, &mut self.left);
+            self.storage.lookup(meta, LookupOp::Next, &mut self.left);
         }
         if let Some((curr_key, _value)) = &self.left.curr {
             match &self.till {
@@ -227,36 +218,36 @@ impl<'a> StorageIterator<'a> {
 
     fn next_back_locked(
         &mut self,
-        db: &Database,
+        meta: &Metadata,
     ) -> Option<<StorageIterator<'a> as Iterator>::Item> {
-        if self.right.stack.len() == 0 {
+        if self.right.stack.is_empty() {
             match &self.till {
                 Bound::Included(key) => {
                     self.storage
-                        .lookup(db, LookupOp::GreaterOrEqual(key), &mut self.right);
+                        .lookup(meta, LookupOp::GreaterOrEqual(key), &mut self.right);
                     if let Some((curr_key, _value)) = &self.right.curr {
                         if curr_key > key {
-                            self.storage.lookup(db, LookupOp::Prev, &mut self.right);
+                            self.storage.lookup(meta, LookupOp::Prev, &mut self.right);
                         }
                     } else {
-                        self.storage.lookup(db, LookupOp::Last, &mut self.right);
+                        self.storage.lookup(meta, LookupOp::Last, &mut self.right);
                     }
                 }
                 Bound::Excluded(key) => {
                     self.storage
-                        .lookup(db, LookupOp::GreaterOrEqual(key), &mut self.right);
+                        .lookup(meta, LookupOp::GreaterOrEqual(key), &mut self.right);
                     if let Some((curr_key, _value)) = &self.right.curr {
                         if curr_key >= key {
-                            self.storage.lookup(db, LookupOp::Prev, &mut self.right);
+                            self.storage.lookup(meta, LookupOp::Prev, &mut self.right);
                         }
                     } else {
-                        self.storage.lookup(db, LookupOp::Last, &mut self.right);
+                        self.storage.lookup(meta, LookupOp::Last, &mut self.right);
                     }
                 }
-                Bound::Unbounded => self.storage.lookup(db, LookupOp::Last, &mut self.right),
+                Bound::Unbounded => self.storage.lookup(meta, LookupOp::Last, &mut self.right),
             }
         } else {
-            self.storage.lookup(db, LookupOp::Prev, &mut self.right);
+            self.storage.lookup(meta, LookupOp::Prev, &mut self.right);
         }
         if let Some((curr_key, _value)) = &self.right.curr {
             match &self.from {
@@ -283,10 +274,10 @@ impl<'a> Iterator for StorageIterator<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(trans) = self.trans {
             assert!(trans.status == TransactionStatus::InProgress);
-            self.next_locked(&trans.db)
+            self.next_locked(&trans.db.meta)
         } else {
-            let db = self.storage.db.read().unwrap();
-            self.next_locked(&db)
+            let meta = self.storage.meta_shadow.read().unwrap();
+            self.next_locked(&meta)
         }
     }
 }
@@ -295,10 +286,10 @@ impl<'a> DoubleEndedIterator for StorageIterator<'a> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if let Some(trans) = self.trans {
             assert!(trans.status == TransactionStatus::InProgress);
-            self.next_back_locked(&trans.db)
+            self.next_back_locked(&trans.db.meta)
         } else {
-            let db = self.storage.db.read().unwrap();
-            self.next_back_locked(&db)
+            let meta = self.storage.meta_shadow.read().unwrap();
+            self.next_back_locked(&meta)
         }
     }
 }
@@ -309,6 +300,7 @@ impl<'a> DoubleEndedIterator for StorageIterator<'a> {
 ///
 pub struct Storage {
     db: RwLock<Database>,
+    meta_shadow: RwLock<Metadata>, // shdow copy of metadata for concurrent read-only access
     buf_mgr: Mutex<BufferManager>,
     busy_events: [Condvar; N_BUSY_EVENTS],
     pool: Vec<RwLock<PageData>>,
@@ -352,6 +344,7 @@ struct Metadata {
     used: PageId,                          // number of used database pages
     root: PageId,                          // B-Tree root page
     height: u32,                           // height of B-Tree
+    lsn: u64,                              // update counter
     alloc_pages: [PageId; N_BITMAP_PAGES], // allocator bitmap pages
 }
 
@@ -370,27 +363,28 @@ impl Metadata {
 // Database shared state
 //
 struct Database {
-    meta: Metadata,                   // cached metadata (stored in root page)
-    lsn: LSN,                         // database modification counter
-    n_aborted_txns: LSN,              // number of aborted transactions
-    state: DatabaseState,             // database state
+    meta: Metadata,                   // main copy of database metadata
     alloc_page: usize,                // index of current allocator internal page
     alloc_page_pos: usize,            // allocator current position in internal page
     cow_map: HashMap<PageId, PageId>, // copy-on-write map: we have to store this mapping to avoid creation of redundant copies
     pending_deletes: Vec<PageId>, // we can no immedately delete pages, because deleted page can be reused and can not be stored in `cow` map
     n_alloc_pages: u64,           // number of allocated pages since session start
     n_free_pages: u64,            // number of deallocated pages since session start
-    modified: bool,               // database was modified by current transaction
+    n_committed_txns: u64,        // number of committed transactions
+    n_aborted_txns: u64,          // number of aborted transactions
 }
 
 impl Database {
+    fn is_modified(&self) -> bool {
+        !(self.cow_map.is_empty() && self.pending_deletes.is_empty())
+    }
+
     fn get_info(&self) -> DatabaseInfo {
         DatabaseInfo {
             db_size: self.meta.size as u64 * PAGE_SIZE as u64,
             db_used: self.meta.used as u64 * PAGE_SIZE as u64,
             tree_height: self.meta.height as usize,
-            state: self.state,
-            n_committed_transactions: self.lsn,
+            n_committed_transactions: self.n_committed_txns,
             n_aborted_transactions: self.n_aborted_txns,
             n_alloc_pages: self.n_alloc_pages,
             n_free_pages: self.n_free_pages,
@@ -421,6 +415,7 @@ struct BufferManager {
 //
 // Wrapper class for accessing page data
 //
+#[derive(Clone, Copy)]
 struct PageData {
     data: [u8; PAGE_SIZE],
 }
@@ -777,10 +772,18 @@ impl BufferManager {
     //
     // Change pid for copied buffer
     //
-    fn copy_on_write(&mut self, id: BufferId, new_pid: PageId) {
-        self.remove(id);
-        self.buffers[id as usize].pid = new_pid;
-        self.insert(id);
+    fn copy_on_write(&mut self, id: BufferId, new_pid: PageId) -> Result<(BufferId, PageId)> {
+        if self.buffers[id as usize].access_count == 1 {
+            // If we are the only user of the buffer, we can replace it's PID in place.
+            self.remove(id);
+            self.forget_buffer(new_pid);
+            self.buffers[id as usize].pid = new_pid;
+            self.insert(id);
+            Ok((id, 0))
+        } else {
+            // otherwise create new buffer
+            self.get_buffer(new_pid)
+        }
     }
 
     //
@@ -814,13 +817,6 @@ impl BufferManager {
             }
             buf = self.buffers[buf as usize].collision;
         }
-        self.new_buffer(pid)
-    }
-
-    //
-    // Allocate new buffer.
-    //
-    fn new_buffer(&mut self, pid: PageId) -> Result<(BufferId, PageId)> {
         // page not found in cache
         let mut evicted_pid = 0;
         let mut buf = self.free_buffers;
@@ -843,13 +839,7 @@ impl BufferManager {
                 debug_assert!(self.buffers[victim as usize].access_count == 0);
                 if (self.buffers[victim as usize].state & PAGE_DIRTY) != 0 {
                     // remove page from dirty vector
-                    let last_dirty = self.dirty_buffers.pop().unwrap();
-                    if last_dirty != victim {
-                        // Replace 'victim' in dirty_buffers vector with last element
-                        let dirty_index = self.buffers[victim as usize].dirty_index;
-                        self.buffers[last_dirty as usize].dirty_index = dirty_index;
-                        self.dirty_buffers[dirty_index as usize] = last_dirty;
-                    }
+                    self.undirty_buffer(victim);
                     evicted_pid = self.buffers[victim as usize].pid;
                 }
                 debug_assert!((self.buffers[victim as usize].state & (PAGE_BUSY | PAGE_RAW)) == 0);
@@ -863,6 +853,33 @@ impl BufferManager {
         self.buffers[buf as usize].state = PAGE_RAW;
         self.insert(buf);
         Ok((buf, evicted_pid))
+    }
+
+    //
+    // Allocate new buffer.
+    //
+    fn new_buffer(&mut self, pid: PageId) -> Result<(BufferId, PageId)> {
+        let (buf, evicted_pid) = self.get_buffer(pid)?;
+        debug_assert!(self.buffers[buf as usize].access_count == 1);
+        debug_assert!((self.buffers[buf as usize].state & PAGE_DIRTY) == 0);
+        self.buffers[buf as usize].state = PAGE_RAW;
+        Ok((buf, evicted_pid))
+    }
+
+    //
+    // Remove dirty mark from the buffer
+    //
+    fn undirty_buffer(&mut self, buf: BufferId) {
+        if (self.buffers[buf as usize].state & PAGE_DIRTY) != 0 {
+            let last_dirty = self.dirty_buffers.pop().unwrap();
+            if last_dirty != buf {
+                // Replace 'buf' in dirty_buffers vector with last element
+                let dirty_index = self.buffers[buf as usize].dirty_index;
+                self.buffers[last_dirty as usize].dirty_index = dirty_index;
+                self.dirty_buffers[dirty_index as usize] = last_dirty;
+            }
+            self.buffers[buf as usize].state &= !PAGE_DIRTY;
+        }
     }
 }
 
@@ -878,9 +895,10 @@ impl<'a> PageGuard<'a> {
     //
     fn modify(&mut self, db: &mut Database, bitmap_page: Option<usize>) -> Result<()> {
         let mut bm = self.storage.buf_mgr.lock().unwrap();
-        if bm.modify_buffer(self.buf) {
+        let old_buf = self.buf;
+        if bm.modify_buffer(old_buf) {
             // first update of the page
-            let old_pid = bm.buffers[self.buf as usize].pid;
+            let old_pid = bm.buffers[old_buf as usize].pid;
             drop(bm);
             // Check if it is already copied
             if !db.cow_map.contains_key(&old_pid) {
@@ -888,11 +906,26 @@ impl<'a> PageGuard<'a> {
                 let new_pid = self.storage.allocate_page(db)?;
                 db.cow_map.insert(new_pid, old_pid); // remember COW mapping
                 self.pid = new_pid;
-                self.storage
-                    .buf_mgr
-                    .lock()
-                    .unwrap()
-                    .copy_on_write(self.buf, new_pid);
+                let mgr = &self.storage.buf_mgr;
+                let (new_buf, evicted_pid) = mgr.lock().unwrap().copy_on_write(old_buf, new_pid)?;
+                if evicted_pid != 0 {
+                    // dirty page was evicted
+                    let page = self.storage.pool[new_buf as usize].read().unwrap();
+                    self.storage
+                        .file
+                        .write_all_at(&page.data, evicted_pid as u64 * PAGE_SIZE as u64)?;
+                }
+                if new_buf != old_buf {
+                    // Copy page content to the new buffer
+                    let mut dst = self.storage.pool[new_buf as usize].write().unwrap();
+                    let src = self.storage.pool[old_buf as usize].read().unwrap();
+                    *dst = *src;
+                    let mut bm = mgr.lock().unwrap();
+                    bm.undirty_buffer(old_buf);
+                    bm.release_buffer(old_buf);
+                    assert!(bm.modify_buffer(new_buf));
+                    self.buf = new_buf;
+                }
                 // Prevent infinite recursion
                 if let Some(alloc_page) = bitmap_page {
                     db.meta.alloc_pages[alloc_page] = new_pid;
@@ -919,7 +952,6 @@ impl Storage {
     //
     fn allocate_page(&self, db: &mut Database) -> Result<PageId> {
         db.n_alloc_pages += 1;
-        db.modified = true;
         //
         // Cyclic scan of bitmap pages. We start with position pointed by (alloc_page,alloc_page_pos)
         // and continue iteration until we hole or reach end of bitmap.
@@ -994,10 +1026,10 @@ impl Storage {
         }
     }
 
-    fn test_allocator_bitmap(&self, db: &Database, pid: PageId) -> Result<bool> {
+    fn test_allocator_bitmap(&self, meta: &Metadata, pid: PageId) -> Result<bool> {
         let alloc_page = pid as usize / ALLOC_BITMAP_SIZE;
         let bit = pid as usize % ALLOC_BITMAP_SIZE;
-        let bp = db.meta.alloc_pages[alloc_page];
+        let bp = meta.alloc_pages[alloc_page];
         let pin = self.get_page(bp)?;
         Ok(self.pool[pin.buf as usize].read().unwrap().test_bit(bit))
     }
@@ -1150,10 +1182,21 @@ impl Storage {
         }
     }
 
+    fn update_snapshot(&self, db: &mut Database) {
+        *self.meta_shadow.write().unwrap() = db.meta;
+    }
+
     fn commit(&self, db: &mut Database) -> Result<()> {
-        assert!(self.buf_mgr.lock().unwrap().pinned == 1);
+        let result = self.try_commit(db);
+        if result.is_err() {
+            self.rollback(db);
+        }
+        result
+    }
+
+    fn try_commit(&self, db: &mut Database) -> Result<()> {
         // Check if something was changed
-        if db.modified {
+        if db.is_modified() {
             // First prepare deallocation...
             let mut pending_deletes: Vec<PageId> = Vec::new();
             std::mem::swap(&mut db.pending_deletes, &mut pending_deletes);
@@ -1182,15 +1225,16 @@ impl Storage {
             if !self.conf.nosync {
                 self.file.sync_all()?;
             }
-
+            db.meta.lsn += 1;
             let meta = db.meta.pack();
             self.file.write_all_at(&meta, 0)?;
             if !self.conf.nosync {
                 self.file.sync_all()?;
             }
+            db.n_committed_txns += 1;
 
-            db.lsn += 1;
-            db.modified = false;
+            // Let all other transactions see our changes
+            self.update_snapshot(db);
         }
         Ok(())
     }
@@ -1216,10 +1260,9 @@ impl Storage {
     //
     // Rollback current transaction
     //
-    fn rollback(&self, db: &mut Database) -> Result<()> {
+    fn rollback(&self, db: &mut Database) {
         let mut bm = self.buf_mgr.lock().unwrap();
-        assert!(bm.pinned == 1);
-        if db.modified {
+        if db.is_modified() {
             // Just throw away all dirty buffers from buffer cache to force reloading of original pages
             for i in 0..bm.dirty_buffers.len() {
                 let buf = bm.dirty_buffers[i];
@@ -1236,16 +1279,11 @@ impl Storage {
             for (new, _old) in &cow_map {
                 bm.forget_buffer(*new);
             }
-
-            // reread metadata from disk
-            let mut page = self.pool[0].write().unwrap();
-            self.file.read_exact_at(&mut page.data, 0)?;
-            db.meta = Metadata::unpack(&page.data);
+            // restore old metadata state
+            db.meta = *self.meta_shadow.read().unwrap();
             db.n_aborted_txns += 1;
             db.pending_deletes.clear();
-            db.modified = false;
         }
-        Ok(())
     }
 
     ///
@@ -1278,6 +1316,7 @@ impl Storage {
                 used: 1,
                 root: 0,
                 height: 0,
+                lsn: 0,
                 alloc_pages: [0u32; N_BITMAP_PAGES],
             };
             let metadata = meta.pack();
@@ -1301,18 +1340,17 @@ impl Storage {
                 .collect(),
             file,
             conf,
+            meta_shadow: RwLock::new(meta),
             db: RwLock::new(Database {
-                lsn: 0,
-                n_aborted_txns: 0,
                 meta,
-                state: DatabaseState::Opened,
                 alloc_page: 0,
                 alloc_page_pos: 0,
                 cow_map: HashMap::new(),
                 pending_deletes: Vec::new(),
                 n_alloc_pages: 0,
                 n_free_pages: 0,
-                modified: false,
+                n_committed_txns: 0,
+                n_aborted_txns: 0,
             }),
         };
         Ok(storage)
@@ -1416,10 +1454,10 @@ impl Storage {
         height: u32,
     ) -> Result<PageId> {
         let mut pin = self.get_page(pid)?;
-        let mut page = self.pool[pin.buf as usize].write().unwrap();
+        let page = self.pool[pin.buf as usize].read().unwrap();
         let mut l: ItemPointer = 0;
-        let n = page.get_n_items();
-        let mut r = n;
+        let n_items = page.get_n_items();
+        let mut r = n_items;
         while l < r {
             let m = (l + r) >> 1;
             if page.compare_key(m, key) == Ordering::Greater {
@@ -1431,27 +1469,49 @@ impl Storage {
         debug_assert!(l == r);
         if height == 1 {
             // leaf page
-            if r < n && page.compare_key(r, key) == Ordering::Equal {
-                pin.modify(db, None)?;
-                page.remove_key(r, true);
+            if r < n_items && page.compare_key(r, key) == Ordering::Equal {
+                drop(page);
+                if n_items != 1 {
+                    pin.modify(db, None)?;
+                    let mut page = self.pool[pin.buf as usize].write().unwrap();
+                    page.remove_key(r, true);
+                    Ok(pin.pid)
+                } else {
+                    // free page
+                    db.pending_deletes.push(pid);
+                    // avoid redundant write of deleted page modifications to the disk
+                    self.buf_mgr.lock().unwrap().undirty_buffer(pin.buf);
+                    Ok(0)
+                }
+            } else {
+                Ok(pid)
             }
         } else {
             // recurse to next level
-            debug_assert!(r < n);
-            let pid = self.btree_remove(db, page.get_child(r), key, height - 1)?;
-            pin.modify(db, None)?;
-            if pid == 0 {
-                page.remove_key(r, false);
+            debug_assert!(r < n_items);
+            let old_child = page.get_child(r);
+            drop(page);
+            let new_child = self.btree_remove(db, old_child, key, height - 1)?;
+            if new_child == 0 {
+                // underflow
+                if n_items != 1 {
+                    pin.modify(db, None)?;
+                    let mut page = self.pool[pin.buf as usize].write().unwrap();
+                    page.remove_key(r, false);
+                    Ok(pin.pid)
+                } else {
+                    // free page
+                    db.pending_deletes.push(pid);
+                    // avoid redundant write of deleted page modifications to the disk
+                    self.buf_mgr.lock().unwrap().undirty_buffer(pin.buf);
+                    Ok(0)
+                }
             } else {
-                page.set_child(r, pid);
+                pin.modify(db, None)?;
+                let mut page = self.pool[pin.buf as usize].write().unwrap();
+                page.set_child(r, new_child);
+                Ok(pin.pid)
             }
-        }
-        if page.get_n_items() == 0 {
-            // free page
-            db.pending_deletes.push(pid);
-            Ok(0)
-        } else {
-            Ok(pin.pid)
         }
     }
 
@@ -1467,7 +1527,7 @@ impl Storage {
         height: u32,
     ) -> Result<(PageId, Option<(Key, PageId)>)> {
         let mut pin = self.get_page(pid)?;
-        let mut page = self.pool[pin.buf as usize].write().unwrap();
+        let page = self.pool[pin.buf as usize].read().unwrap();
         let mut l: ItemPointer = 0;
         let n = page.get_n_items();
         let mut r = n;
@@ -1482,7 +1542,9 @@ impl Storage {
         debug_assert!(l == r);
         if height == 1 {
             // leaf page
+            drop(page);
             pin.modify(db, None)?;
+            let mut page = self.pool[pin.buf as usize].write().unwrap();
             if r < n && page.compare_key(r, key) == Ordering::Equal {
                 // replace old value with new one: just remove old one and reinsert new key-value pair
                 page.remove_key(r, true);
@@ -1494,9 +1556,11 @@ impl Storage {
         } else {
             // recurse to next level
             debug_assert!(r < n);
-            let (child, overflow) =
-                self.btree_insert(db, page.get_child(r), key, value, height - 1)?;
+            let r_child = page.get_child(r);
+            drop(page);
+            let (child, overflow) = self.btree_insert(db, r_child, key, value, height - 1)?;
             pin.modify(db, None)?;
+            let mut page = self.pool[pin.buf as usize].write().unwrap();
             page.set_child(r, child);
             if let Some((key, child)) = overflow {
                 // insert new page before original
@@ -1559,17 +1623,16 @@ impl Storage {
     //
     fn do_lookup(
         &self,
-        db: &Database,
+        meta: &Metadata,
         op: LookupOp,
         path: &mut TreePath,
     ) -> Result<Option<(Key, Value)>> {
-        ensure!(db.state == DatabaseState::Opened);
         match op {
             LookupOp::First => {
                 // Locate left-most element in the tree
-                let mut pid = db.meta.root;
+                let mut pid = meta.root;
                 if pid != 0 {
-                    let mut level = db.meta.height;
+                    let mut level = meta.height;
                     loop {
                         let pin = self.get_page(pid)?;
                         let page = self.pool[pin.buf as usize].read().unwrap();
@@ -1577,7 +1640,7 @@ impl Storage {
                         level -= 1;
                         if level == 0 {
                             path.curr = Some(page.get_item(0));
-                            path.lsn = db.lsn;
+                            path.lsn = meta.lsn;
                             break;
                         } else {
                             pid = page.get_child(0)
@@ -1587,9 +1650,9 @@ impl Storage {
             }
             LookupOp::Last => {
                 // Locate right-most element in the tree
-                let mut pid = db.meta.root;
+                let mut pid = meta.root;
                 if pid != 0 {
-                    let mut level = db.meta.height;
+                    let mut level = meta.height;
                     loop {
                         let pin = self.get_page(pid)?;
                         let page = self.pool[pin.buf as usize].read().unwrap();
@@ -1598,7 +1661,7 @@ impl Storage {
                         path.stack.push(PagePos { pid, pos });
                         if level == 0 {
                             path.curr = Some(page.get_item(pos));
-                            path.lsn = db.lsn;
+                            path.lsn = meta.lsn;
                             break;
                         } else {
                             pid = page.get_child(pos)
@@ -1607,18 +1670,18 @@ impl Storage {
                 }
             }
             LookupOp::Next => {
-                if path.lsn == db.lsn || self.reconstruct_path(path, db)? {
-                    self.move_forward(path, db.meta.height)?;
+                if path.lsn == meta.lsn || self.reconstruct_path(path, meta)? {
+                    self.move_forward(path, meta.height)?;
                 }
             }
             LookupOp::Prev => {
-                if path.lsn == db.lsn || self.reconstruct_path(path, db)? {
-                    self.move_backward(path, db.meta.height)?;
+                if path.lsn == meta.lsn || self.reconstruct_path(path, meta)? {
+                    self.move_backward(path, meta.height)?;
                 }
             }
             LookupOp::GreaterOrEqual(key) => {
-                if db.meta.root != 0 && self.find(db.meta.root, path, &key, db.meta.height)? {
-                    path.lsn = db.lsn;
+                if meta.root != 0 && self.find(meta.root, path, &key, meta.height)? {
+                    path.lsn = meta.lsn;
                 }
             }
         }
@@ -1628,8 +1691,8 @@ impl Storage {
     //
     // Perform lookup in the database. Initialize path in the tree current element or reset path if no element is found or end of set is reached.
     //
-    fn lookup(&self, db: &Database, op: LookupOp, path: &mut TreePath) {
-        let result = self.do_lookup(db, op, path);
+    fn lookup(&self, meta: &Metadata, op: LookupOp, path: &mut TreePath) {
+        let result = self.do_lookup(meta, op, path);
         if result.is_err() {
             path.curr = None;
         }
@@ -1691,13 +1754,14 @@ impl Storage {
     // If storage is updated between iterations then try to reconstruct path by locating current element.
     // Returns true is such element is found and path is successfully reconstructed, false otherwise.
     //
-    fn reconstruct_path(&self, path: &mut TreePath, db: &Database) -> Result<bool> {
+    fn reconstruct_path(&self, path: &mut TreePath, meta: &Metadata) -> Result<bool> {
         path.stack.clear();
         if let Some((key, _value)) = &path.curr.clone() {
-            if self.find(db.meta.root, path, &key, db.meta.height)? {
+            if self.find(meta.root, path, &key, meta.height)? {
                 if let Some((ge_key, _value)) = &path.curr {
                     if ge_key == key {
-                        path.lsn = db.lsn;
+                        path.lsn = meta.lsn;
+                        debug_assert!(path.stack.len() == meta.height as usize);
                         return Ok(true);
                     }
                 }
@@ -1778,8 +1842,14 @@ impl Storage {
         Ok(())
     }
 
-    fn traverse(&self, db: &Database, pid: PageId, prev_key: &mut Key, height: u32) -> Result<u64> {
-        ensure!(self.test_allocator_bitmap(db, pid)?);
+    fn traverse(
+        &self,
+        meta: &Metadata,
+        pid: PageId,
+        prev_key: &mut Key,
+        height: u32,
+    ) -> Result<u64> {
+        ensure!(self.test_allocator_bitmap(meta, pid)?);
         let pin = self.get_page(pid)?;
         let page = self.pool[pin.buf as usize].read().unwrap();
         let n_items = page.get_n_items();
@@ -1792,7 +1862,7 @@ impl Storage {
             count += n_items as u64;
         } else {
             for i in 0..n_items {
-                count += self.traverse(db, page.get_child(i), prev_key, height - 1)?;
+                count += self.traverse(meta, page.get_child(i), prev_key, height - 1)?;
                 let ord = page.compare_key(i, prev_key);
                 ensure!(ord == Ordering::Less || ord == Ordering::Equal);
             }
@@ -1819,19 +1889,8 @@ impl Storage {
         to_remove: &mut dyn Iterator<Item = Result<Key>>,
     ) -> Result<()> {
         let mut db = self.db.write().unwrap(); // prevent concurrent access to the database during update operations (MURSIW)
-        ensure!(db.state == DatabaseState::Opened);
-        let mut result = self.do_updates(&mut db, to_upsert, to_remove);
-        if result.is_ok() {
-            result = self.commit(&mut db);
-            if !result.is_ok() {
-                db.state = DatabaseState::Corrupted;
-            }
-        } else {
-            if !self.rollback(&mut db).is_ok() {
-                db.state = DatabaseState::Corrupted;
-            }
-        }
-        result
+        self.do_updates(&mut db, to_upsert, to_remove)?;
+        self.commit(&mut db)
     }
 
     ///
@@ -1839,16 +1898,16 @@ impl Storage {
     ///
     pub fn verify(&self) -> Result<u64> {
         let db = self.db.read().unwrap();
-        ensure!(db.state == DatabaseState::Opened);
-        ensure!(self.test_allocator_bitmap(&db, 0)?);
-        for pid in db.meta.alloc_pages {
+        let meta = &db.meta;
+        ensure!(self.test_allocator_bitmap(meta, 0)?);
+        for pid in meta.alloc_pages {
             if pid != 0 {
-                ensure!(self.test_allocator_bitmap(&db, pid)?);
+                ensure!(self.test_allocator_bitmap(meta, pid)?);
             }
         }
         if db.meta.root != 0 {
             let mut prev_key = Vec::new();
-            self.traverse(&db, db.meta.root, &mut prev_key, db.meta.height)
+            self.traverse(meta, db.meta.root, &mut prev_key, db.meta.height)
         } else {
             Ok(0)
         }
@@ -1956,23 +2015,6 @@ impl Storage {
     }
 
     ///
-    /// Close storage. Close data and WAL files and truncate WAL file.
-    ///
-    pub fn close(&self) -> Result<()> {
-        if let Ok(mut db) = self.db.write() {
-            // avoid poisoned lock
-            if db.state == DatabaseState::Opened {
-                // Complete delayed commit
-                if db.modified {
-                    self.commit(&mut db)?;
-                }
-                db.state = DatabaseState::Closed;
-            }
-        }
-        Ok(())
-    }
-
-    ///
     /// Get database info
     ///
     pub fn get_database_info(&self) -> DatabaseInfo {
@@ -1995,7 +2037,13 @@ impl Storage {
 
 impl Drop for Storage {
     fn drop(&mut self) {
-        self.close().unwrap();
+        // Avoid poisoned lock
+        if let Ok(mut db) = self.db.write() {
+            // Complete delayed commit
+            if db.is_modified() {
+                self.commit(&mut db).unwrap();
+            }
+        }
     }
 }
 
@@ -2003,8 +2051,7 @@ impl<'a> Transaction<'_> {
     ///
     /// Commit transaction
     ///
-    pub fn commit(&mut self) -> Result<()> {
-        ensure!(self.status == TransactionStatus::InProgress);
+    pub fn commit(mut self) -> Result<()> {
         self.storage.commit(&mut self.db)?;
         self.status = TransactionStatus::Committed;
         Ok(())
@@ -2013,9 +2060,9 @@ impl<'a> Transaction<'_> {
     ///
     /// Delay commit of transaction
     ///
-    pub fn delay(&mut self) -> Result<()> {
-        ensure!(self.status == TransactionStatus::InProgress);
-        self.db.lsn += 1;
+    pub fn delay(mut self) -> Result<()> {
+        self.db.meta.lsn += 1;
+        self.storage.update_snapshot(&mut self.db);
         // mark transaction as committed to prevent implicit rollback by destructor
         self.status = TransactionStatus::Committed;
         Ok(())
@@ -2024,9 +2071,8 @@ impl<'a> Transaction<'_> {
     ///
     /// Rollback transaction undoing all changes
     ///
-    pub fn rollback(&mut self) -> Result<()> {
-        ensure!(self.status == TransactionStatus::InProgress);
-        self.storage.rollback(&mut self.db)?;
+    pub fn rollback(mut self) -> Result<()> {
+        self.storage.rollback(&mut self.db);
         self.status = TransactionStatus::Aborted;
         Ok(())
     }
@@ -2035,7 +2081,6 @@ impl<'a> Transaction<'_> {
     /// Insert new key in the storage or update existed key as part of this transaction.
     ///
     pub fn put(&mut self, key: &Key, value: &Value) -> Result<()> {
-        ensure!(self.status == TransactionStatus::InProgress);
         self.storage.do_upsert(&mut self.db, key, value)?;
         Ok(())
     }
@@ -2059,7 +2104,6 @@ impl<'a> Transaction<'_> {
     /// Does nothing if key not exist.
     ///
     pub fn remove(&mut self, key: &Key) -> Result<()> {
-        ensure!(self.status == TransactionStatus::InProgress);
         self.storage.do_remove(&mut self.db, key)?;
         Ok(())
     }
@@ -2141,7 +2185,7 @@ impl<'a> Transaction<'_> {
 impl<'a> Drop for Transaction<'a> {
     fn drop(&mut self) {
         if self.status == TransactionStatus::InProgress {
-            self.storage.rollback(&mut self.db).unwrap();
+            self.storage.rollback(&mut self.db);
         }
     }
 }
