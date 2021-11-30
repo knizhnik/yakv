@@ -9,7 +9,7 @@ use std::ops::Bound::*;
 use std::ops::{Bound, RangeBounds};
 use std::os::unix::prelude::FileExt as UnixFileExt;
 use std::path::Path;
-use std::sync::{Condvar, Mutex, RwLock, RwLockWriteGuard};
+use std::sync::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 type PageId = u32; // address of page in the file
 type BufferId = u32; // index of page in buffer cache
@@ -70,6 +70,8 @@ pub struct StorageConfig {
     pub cache_size: usize,
     // Do not sync written pages
     pub nosync: bool,
+    //  Prevent concurrent execution of readers and writer
+    pub mursiw: bool,
 }
 
 impl StorageConfig {
@@ -77,6 +79,7 @@ impl StorageConfig {
         StorageConfig {
             cache_size: 128 * 1024, // 1Gb
             nosync: false,
+            mursiw: false,
         }
     }
 }
@@ -92,13 +95,31 @@ pub enum TransactionStatus {
 }
 
 ///
-/// Explicitly started transaction. Storage can be updated in autocommit mode
+/// Explicitly started read-write transaction. Storage can be updated in autocommit mode
 /// or using explicitly started transaction.
 ///
 pub struct Transaction<'a> {
     pub status: TransactionStatus,
     storage: &'a Storage,
     db: RwLockWriteGuard<'a, Database>,
+}
+
+///
+/// Read-only transaction for MURSIW mode. If you need concurrent execution of readers and writer,
+/// then use snapshot
+///
+pub struct ReadOnlyTransaction<'a> {
+    storage: &'a Storage,
+    db: RwLockReadGuard<'a, Database>,
+}
+
+///
+/// Class for taking snapshot of the storage: capturing state of the storage
+/// preventing oncurrent changes
+///
+pub struct Snapshot<'a> {
+    storage: &'a Storage,
+    meta: RwLockReadGuard<'a, Metadata>,
 }
 
 ///
@@ -140,7 +161,7 @@ pub struct CacheInfo {
 ///
 pub struct StorageIterator<'a> {
     storage: &'a Storage,
-    trans: Option<&'a Transaction<'a>>,
+    meta: Option<&'a Metadata>,
     from: Bound<Key>,
     till: Bound<Key>,
     left: TreePath,
@@ -272,9 +293,11 @@ impl<'a> Iterator for StorageIterator<'a> {
     type Item = Result<(Key, Value)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(trans) = self.trans {
-            assert!(trans.status == TransactionStatus::InProgress);
-            self.next_locked(&trans.db.meta)
+        if let Some(meta) = self.meta {
+            self.next_locked(meta)
+        } else if self.storage.conf.mursiw {
+            let meta = self.storage.db.read().unwrap().meta;
+            self.next_locked(&meta)
         } else {
             let meta = self.storage.meta_shadow.read().unwrap();
             self.next_locked(&meta)
@@ -284,9 +307,11 @@ impl<'a> Iterator for StorageIterator<'a> {
 
 impl<'a> DoubleEndedIterator for StorageIterator<'a> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        if let Some(trans) = self.trans {
-            assert!(trans.status == TransactionStatus::InProgress);
-            self.next_back_locked(&trans.db.meta)
+        if let Some(meta) = self.meta {
+            self.next_back_locked(meta)
+        } else if self.storage.conf.mursiw {
+            let meta = self.storage.db.read().unwrap().meta;
+            self.next_back_locked(&meta)
         } else {
             let meta = self.storage.meta_shadow.read().unwrap();
             self.next_back_locked(&meta)
@@ -1174,11 +1199,38 @@ impl Storage {
         })
     }
 
+    ///
+    /// Take database snasphot for providing repeatable reads.
+    /// Snapshot blocks commit of update transaction.
+    ///
+    pub fn take_snapshot(&self) -> Snapshot<'_> {
+        Snapshot {
+            storage: self,
+            meta: self.meta_shadow.read().unwrap(),
+        }
+    }
+
+    ///
+    /// Start update transaction. Transaction should be either committed,
+    /// either aborted. If transaction is not explicitly committed,
+    /// then it is implicitly aborted when left out of scope.
+    ///
     pub fn start_transaction(&self) -> Transaction<'_> {
         Transaction {
             status: TransactionStatus::InProgress,
             storage: self,
             db: self.db.write().unwrap(),
+        }
+    }
+
+    ///
+    /// Start read-only transaction for MURSIW mode. If you need concurrent execution of readers and writer,
+    /// then use take_snapshot()
+    ///
+    pub fn read_only_transaction(&self) -> ReadOnlyTransaction<'_> {
+        ReadOnlyTransaction {
+            storage: self,
+            db: self.db.read().unwrap(),
         }
     }
 
@@ -2006,7 +2058,7 @@ impl Storage {
     pub fn range<R: RangeBounds<Key>>(&self, range: R) -> StorageIterator<'_> {
         StorageIterator {
             storage: &self,
-            trans: None,
+            meta: None,
             from: range.start_bound().cloned(),
             till: range.end_bound().cloned(),
             left: TreePath::new(),
@@ -2047,6 +2099,100 @@ impl Drop for Storage {
     }
 }
 
+impl<'a> Snapshot<'_> {
+    ///
+    /// Iterator through pairs in key ascending order.
+    /// Byte-wise comparison is used, to it is up to serializer to enforce proper ordering,
+    /// for example for unsigned integer type big-endian encoding should be used.
+    ///
+    pub fn iter(&self) -> StorageIterator<'_> {
+        self.range(..)
+    }
+
+    ///
+    /// Lookup key in the storage.
+    ///
+    pub fn get(&self, key: &Key) -> Result<Option<Value>> {
+        let mut iter = self.range((Included(key), Included(key)));
+        Ok(iter.next().transpose()?.map(|kv| kv.1))
+    }
+
+    ///
+    /// Lookup u32 key in the storage.
+    ///
+    pub fn get_u32(&self, key: u32) -> Result<Option<Value>> {
+        self.get(&key.to_be_bytes().to_vec())
+    }
+
+    ///
+    /// Lookup u64 key in the storage.
+    ///
+    pub fn get_u64(&self, key: u64) -> Result<Option<Value>> {
+        self.get(&key.to_be_bytes().to_vec())
+    }
+
+    ///
+    /// Returns bidirectional iterator
+    ///
+    pub fn range<R: RangeBounds<Key>>(&self, range: R) -> StorageIterator<'_> {
+        StorageIterator {
+            storage: self.storage,
+            meta: Some(&self.meta),
+            from: range.start_bound().cloned(),
+            till: range.end_bound().cloned(),
+            left: TreePath::new(),
+            right: TreePath::new(),
+        }
+    }
+}
+
+impl<'a> ReadOnlyTransaction<'_> {
+    ///
+    /// Iterator through pairs in key ascending order.
+    /// Byte-wise comparison is used, to it is up to serializer to enforce proper ordering,
+    /// for example for unsigned integer type big-endian encoding should be used.
+    ///
+    pub fn iter(&self) -> StorageIterator<'_> {
+        self.range(..)
+    }
+
+    ///
+    /// Lookup key in the storage.
+    ///
+    pub fn get(&self, key: &Key) -> Result<Option<Value>> {
+        let mut iter = self.range((Included(key), Included(key)));
+        Ok(iter.next().transpose()?.map(|kv| kv.1))
+    }
+
+    ///
+    /// Lookup u32 key in the storage.
+    ///
+    pub fn get_u32(&self, key: u32) -> Result<Option<Value>> {
+        self.get(&key.to_be_bytes().to_vec())
+    }
+
+    ///
+    /// Lookup u64 key in the storage.
+    ///
+    pub fn get_u64(&self, key: u64) -> Result<Option<Value>> {
+        self.get(&key.to_be_bytes().to_vec())
+    }
+
+    ///
+    /// Returns bidirectional iterator
+    ///
+    pub fn range<R: RangeBounds<Key>>(&self, range: R) -> StorageIterator<'_> {
+        StorageIterator {
+            storage: self.storage,
+            meta: Some(&self.db.meta),
+            from: range.start_bound().cloned(),
+            till: range.end_bound().cloned(),
+            left: TreePath::new(),
+            right: TreePath::new(),
+        }
+    }
+}
+
 impl<'a> Transaction<'_> {
     ///
     /// Commit transaction
@@ -2058,11 +2204,12 @@ impl<'a> Transaction<'_> {
     }
 
     ///
-    /// Delay commit of transaction
+    /// Delay commit of transaction.
+    /// This method can be used only in MURSIW mode
     ///
     pub fn delay(mut self) -> Result<()> {
+        ensure!(self.storage.conf.mursiw); // supported only in MURSIW mode
         self.db.meta.lsn += 1;
-        self.storage.update_snapshot(&mut self.db);
         // mark transaction as committed to prevent implicit rollback by destructor
         self.status = TransactionStatus::Committed;
         Ok(())
@@ -2159,7 +2306,7 @@ impl<'a> Transaction<'_> {
     pub fn range<R: RangeBounds<Key>>(&self, range: R) -> StorageIterator<'_> {
         StorageIterator {
             storage: self.storage,
-            trans: Some(&self),
+            meta: Some(&self.db.meta),
             from: range.start_bound().cloned(),
             till: range.end_bound().cloned(),
             left: TreePath::new(),
