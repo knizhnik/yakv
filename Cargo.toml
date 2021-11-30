@@ -13,6 +13,8 @@ readme = "README.md"
 [dependencies]
 fs2 = "0.4.3"
 anyhow = "1.0"
+parking_lot = "0.11.2"
+
 
 [dev-dependencies]
 rand = "0.8.3"

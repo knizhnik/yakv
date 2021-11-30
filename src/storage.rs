@@ -1,5 +1,6 @@
 use anyhow::{ensure, Result};
 use fs2::FileExt;
+use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::convert::TryInto;
@@ -9,7 +10,6 @@ use std::ops::Bound::*;
 use std::ops::{Bound, RangeBounds};
 use std::os::unix::prelude::FileExt as UnixFileExt;
 use std::path::Path;
-use std::sync::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 type PageId = u32; // address of page in the file
 type BufferId = u32; // index of page in buffer cache
@@ -296,10 +296,10 @@ impl<'a> Iterator for StorageIterator<'a> {
         if let Some(meta) = self.meta {
             self.next_locked(meta)
         } else if self.storage.conf.mursiw {
-            let meta = self.storage.db.read().unwrap().meta;
+            let meta = self.storage.db.read().meta;
             self.next_locked(&meta)
         } else {
-            let meta = self.storage.meta_shadow.read().unwrap();
+            let meta = self.storage.meta_shadow.read();
             self.next_locked(&meta)
         }
     }
@@ -310,10 +310,10 @@ impl<'a> DoubleEndedIterator for StorageIterator<'a> {
         if let Some(meta) = self.meta {
             self.next_back_locked(meta)
         } else if self.storage.conf.mursiw {
-            let meta = self.storage.db.read().unwrap().meta;
+            let meta = self.storage.db.read().meta;
             self.next_back_locked(&meta)
         } else {
-            let meta = self.storage.meta_shadow.read().unwrap();
+            let meta = self.storage.meta_shadow.read();
             self.next_back_locked(&meta)
         }
     }
@@ -917,7 +917,7 @@ impl<'a> PageGuard<'a> {
     // Copy on write page
     //
     fn modify(&mut self, db: &mut Database, bitmap_page: Option<usize>) -> Result<()> {
-        let mut bm = self.storage.buf_mgr.lock().unwrap();
+        let mut bm = self.storage.buf_mgr.lock();
         let old_buf = self.buf;
         if bm.modify_buffer(old_buf) {
             // first update of the page
@@ -930,20 +930,20 @@ impl<'a> PageGuard<'a> {
                 db.cow_map.insert(new_pid, old_pid); // remember COW mapping
                 self.pid = new_pid;
                 let mgr = &self.storage.buf_mgr;
-                let (new_buf, evicted_pid) = mgr.lock().unwrap().copy_on_write(old_buf, new_pid)?;
+                let (new_buf, evicted_pid) = mgr.lock().copy_on_write(old_buf, new_pid)?;
                 if evicted_pid != 0 {
                     // dirty page was evicted
-                    let page = self.storage.pool[new_buf as usize].read().unwrap();
+                    let page = self.storage.pool[new_buf as usize].read();
                     self.storage
                         .file
                         .write_all_at(&page.data, evicted_pid as u64 * PAGE_SIZE as u64)?;
                 }
                 if new_buf != old_buf {
                     // Copy page content to the new buffer
-                    let mut dst = self.storage.pool[new_buf as usize].write().unwrap();
-                    let src = self.storage.pool[old_buf as usize].read().unwrap();
+                    let mut dst = self.storage.pool[new_buf as usize].write();
+                    let src = self.storage.pool[old_buf as usize].read();
                     *dst = *src;
-                    let mut bm = mgr.lock().unwrap();
+                    let mut bm = mgr.lock();
                     bm.undirty_buffer(old_buf);
                     bm.release_buffer(old_buf);
                     assert!(bm.modify_buffer(new_buf));
@@ -1001,10 +1001,7 @@ impl Storage {
                 db.meta.alloc_pages[db.alloc_page] = pin.pid;
                 if db.alloc_page == 0 {
                     // Initialize first bitmap page: we need to mark root page as occupied
-                    assert!(self.pool[pin.buf as usize]
-                        .write()
-                        .unwrap()
-                        .test_and_set_bit(0));
+                    assert!(self.pool[pin.buf as usize].write().test_and_set_bit(0));
                 }
                 self.mark_page(db, bp)?;
             } else {
@@ -1013,7 +1010,6 @@ impl Storage {
             }
             let bit = self.pool[pin.buf as usize]
                 .read()
-                .unwrap()
                 .find_first_zero_bit(db.alloc_page_pos);
             if bit != usize::MAX {
                 // hole located
@@ -1021,11 +1017,7 @@ impl Storage {
 
                 // Copying of allocator's pages can occupy hole we have found,
                 // so we need first to check if it is still available
-                if self.pool[pin.buf as usize]
-                    .write()
-                    .unwrap()
-                    .test_and_set_bit(bit)
-                {
+                if self.pool[pin.buf as usize].write().test_and_set_bit(bit) {
                     let pid = (db.alloc_page * ALLOC_BITMAP_SIZE + bit) as PageId;
                     if pid >= db.meta.size {
                         db.meta.size = pid + 1;
@@ -1054,7 +1046,7 @@ impl Storage {
         let bit = pid as usize % ALLOC_BITMAP_SIZE;
         let bp = meta.alloc_pages[alloc_page];
         let pin = self.get_page(bp)?;
-        Ok(self.pool[pin.buf as usize].read().unwrap().test_bit(bit))
+        Ok(self.pool[pin.buf as usize].read().test_bit(bit))
     }
 
     fn update_allocator_bitmap(&self, db: &mut Database, pid: PageId, op: BitmapOp) -> Result<()> {
@@ -1070,16 +1062,13 @@ impl Storage {
             }
             BitmapOp::Set => {
                 // Nobody else should use this slot
-                assert!(self.pool[pin.buf as usize]
-                    .write()
-                    .unwrap()
-                    .test_and_set_bit(bit))
+                assert!(self.pool[pin.buf as usize].write().test_and_set_bit(bit))
             }
             BitmapOp::Clear => {
                 // Set allocator's current position to just deallocated page to force its reusing
                 db.alloc_page = alloc_page;
                 db.alloc_page_pos = bit / 8;
-                self.pool[pin.buf as usize].write().unwrap().clear_bit(bit)
+                self.pool[pin.buf as usize].write().clear_bit(bit)
             }
         }
         Ok(())
@@ -1111,7 +1100,7 @@ impl Storage {
     // Unpin page (called by PageGuard)
     //
     fn release_page(&self, buf: BufferId) {
-        let mut bm = self.buf_mgr.lock().unwrap();
+        let mut bm = self.buf_mgr.lock();
         bm.release_buffer(buf);
     }
 
@@ -1129,10 +1118,10 @@ impl Storage {
     fn new_page_at(&self, db: &mut Database, pid: PageId) -> Result<PageGuard<'_>> {
         db.cow_map.insert(pid, 0); // remember new page in COW map to avoid its cloning
 
-        let mut bm = self.buf_mgr.lock().unwrap();
+        let mut bm = self.buf_mgr.lock();
 
         let (buf, evicted_pid) = bm.new_buffer(pid)?;
-        let mut page = self.pool[buf as usize].write().unwrap();
+        let mut page = self.pool[buf as usize].write();
         if evicted_pid != 0 {
             // dirty page was evicted
             self.file
@@ -1153,12 +1142,12 @@ impl Storage {
     // Buffer will be automatically released on exiting from scope
     //
     fn get_page(&self, pid: PageId) -> Result<PageGuard<'_>> {
-        let mut bm = self.buf_mgr.lock().unwrap();
+        let mut bm = self.buf_mgr.lock();
         let (buf, evicted_pid) = bm.get_buffer(pid)?;
         let state = bm.buffers[buf as usize].state;
         if evicted_pid != 0 {
             // dirty page was evicted
-            let page = self.pool[buf as usize].read().unwrap();
+            let page = self.pool[buf as usize].read();
             self.file
                 .write_all_at(&page.data, evicted_pid as u64 * PAGE_SIZE as u64)?;
         }
@@ -1167,9 +1156,7 @@ impl Storage {
             bm.buffers[buf as usize].state |= PAGE_WAIT;
             loop {
                 debug_assert!((bm.buffers[buf as usize].state & PAGE_WAIT) != 0);
-                bm = self.busy_events[buf as usize % N_BUSY_EVENTS]
-                    .wait(bm)
-                    .unwrap();
+                self.busy_events[buf as usize % N_BUSY_EVENTS].wait(&mut bm);
                 if (bm.buffers[buf as usize].state & PAGE_BUSY) == 0 {
                     break;
                 }
@@ -1179,11 +1166,11 @@ impl Storage {
             bm.buffers[buf as usize].state = PAGE_BUSY;
             drop(bm); // read page without holding lock
             {
-                let mut page = self.pool[buf as usize].write().unwrap();
+                let mut page = self.pool[buf as usize].write();
                 self.file
                     .read_exact_at(&mut page.data, pid as u64 * PAGE_SIZE as u64)?;
             }
-            bm = self.buf_mgr.lock().unwrap();
+            bm = self.buf_mgr.lock();
             if (bm.buffers[buf as usize].state & PAGE_WAIT) != 0 {
                 // Somebody is waiting for us
                 self.busy_events[buf as usize % N_BUSY_EVENTS].notify_all();
@@ -1204,7 +1191,7 @@ impl Storage {
     pub fn take_snapshot(&self) -> Snapshot<'_> {
         Snapshot {
             storage: self,
-            meta: self.meta_shadow.read().unwrap(),
+            meta: self.meta_shadow.read(),
         }
     }
 
@@ -1217,7 +1204,7 @@ impl Storage {
         Transaction {
             status: TransactionStatus::InProgress,
             storage: self,
-            db: self.db.write().unwrap(),
+            db: self.db.write(),
         }
     }
 
@@ -1228,12 +1215,12 @@ impl Storage {
     pub fn read_only_transaction(&self) -> ReadOnlyTransaction<'_> {
         ReadOnlyTransaction {
             storage: self,
-            db: self.db.read().unwrap(),
+            db: self.db.read(),
         }
     }
 
-    fn update_snapshot(&self, db: &mut Database) {
-        *self.meta_shadow.write().unwrap() = db.meta;
+    fn update_snapshot(&self, db: &Database) {
+        *self.meta_shadow.write() = db.meta;
     }
 
     fn commit(&self, db: &mut Database) -> Result<()> {
@@ -1268,8 +1255,8 @@ impl Storage {
             for pid in orig {
                 self.free_page(db, pid)?;
             }
-            db.cow_map.clear();
             assert!(n_alloc_pages == db.n_alloc_pages); // no allocation should happen during deallocation
+            db.cow_map.clear();
 
             self.flush_buffers()?;
             if !self.conf.nosync {
@@ -1281,10 +1268,11 @@ impl Storage {
             if !self.conf.nosync {
                 self.file.sync_all()?;
             }
+
             db.n_committed_txns += 1;
 
             // Let all other transactions see our changes
-            self.update_snapshot(db);
+            self.update_snapshot(&db);
         }
         Ok(())
     }
@@ -1293,12 +1281,12 @@ impl Storage {
     // Flush dirty pages to the disk.
     //
     fn flush_buffers(&self) -> Result<()> {
-        let bm: &mut BufferManager = &mut self.buf_mgr.lock().unwrap();
+        let bm: &mut BufferManager = &mut self.buf_mgr.lock();
         for bp in &bm.dirty_buffers {
             let buf = *bp as usize;
             let pid = bm.buffers[buf].pid;
             let file_offs = pid as u64 * PAGE_SIZE as u64;
-            let page = self.pool[buf].read().unwrap();
+            let page = self.pool[buf].read();
             self.file.write_all_at(&page.data, file_offs)?;
             debug_assert!((bm.buffers[buf].state & PAGE_DIRTY) != 0);
             bm.buffers[buf].state = 0;
@@ -1311,7 +1299,7 @@ impl Storage {
     // Rollback current transaction
     //
     fn rollback(&self, db: &mut Database) {
-        let mut bm = self.buf_mgr.lock().unwrap();
+        let mut bm = self.buf_mgr.lock();
         if db.is_modified() {
             // Just throw away all dirty buffers from buffer cache to force reloading of original pages
             for i in 0..bm.dirty_buffers.len() {
@@ -1330,7 +1318,7 @@ impl Storage {
                 bm.forget_buffer(*new);
             }
             // restore old metadata state
-            db.meta = *self.meta_shadow.read().unwrap();
+            db.meta = *self.meta_shadow.read();
             db.n_aborted_txns += 1;
             db.pending_deletes.clear();
         }
@@ -1435,7 +1423,7 @@ impl Storage {
         value: &Value,
     ) -> Result<PageId> {
         let pin = self.new_page(db)?;
-        let mut page = self.pool[pin.buf as usize].write().unwrap();
+        let mut page = self.pool[pin.buf as usize].write();
         page.set_n_items(0);
         page.insert_item(0, key, value);
         Ok(pin.pid)
@@ -1452,7 +1440,7 @@ impl Storage {
         right_child: PageId,
     ) -> Result<PageId> {
         let pin = self.new_page(db)?;
-        let mut page = self.pool[pin.buf as usize].write().unwrap();
+        let mut page = self.pool[pin.buf as usize].write();
         page.set_n_items(0);
         debug_assert!(left_child != 0);
         debug_assert!(right_child != 0);
@@ -1477,7 +1465,7 @@ impl Storage {
         if !page.insert_item(ip, key, value) {
             // page is full then divide page
             let pin = self.new_page(db)?;
-            let mut new_page = self.pool[pin.buf as usize].write().unwrap();
+            let mut new_page = self.pool[pin.buf as usize].write();
             let split = page.split(&mut new_page, ip);
             let ok = if ip > split {
                 page.insert_item(ip - split - 1, key, value)
@@ -1504,7 +1492,7 @@ impl Storage {
         height: u32,
     ) -> Result<PageId> {
         let mut pin = self.get_page(pid)?;
-        let page = self.pool[pin.buf as usize].read().unwrap();
+        let page = self.pool[pin.buf as usize].read();
         let mut l: ItemPointer = 0;
         let n_items = page.get_n_items();
         let mut r = n_items;
@@ -1523,14 +1511,14 @@ impl Storage {
                 drop(page);
                 if n_items != 1 {
                     pin.modify(db, None)?;
-                    let mut page = self.pool[pin.buf as usize].write().unwrap();
+                    let mut page = self.pool[pin.buf as usize].write();
                     page.remove_key(r, true);
                     Ok(pin.pid)
                 } else {
                     // free page
                     db.pending_deletes.push(pid);
                     // avoid redundant write of deleted page modifications to the disk
-                    self.buf_mgr.lock().unwrap().undirty_buffer(pin.buf);
+                    self.buf_mgr.lock().undirty_buffer(pin.buf);
                     Ok(0)
                 }
             } else {
@@ -1546,19 +1534,19 @@ impl Storage {
                 // underflow
                 if n_items != 1 {
                     pin.modify(db, None)?;
-                    let mut page = self.pool[pin.buf as usize].write().unwrap();
+                    let mut page = self.pool[pin.buf as usize].write();
                     page.remove_key(r, false);
                     Ok(pin.pid)
                 } else {
                     // free page
                     db.pending_deletes.push(pid);
                     // avoid redundant write of deleted page modifications to the disk
-                    self.buf_mgr.lock().unwrap().undirty_buffer(pin.buf);
+                    self.buf_mgr.lock().undirty_buffer(pin.buf);
                     Ok(0)
                 }
             } else {
                 pin.modify(db, None)?;
-                let mut page = self.pool[pin.buf as usize].write().unwrap();
+                let mut page = self.pool[pin.buf as usize].write();
                 page.set_child(r, new_child);
                 Ok(pin.pid)
             }
@@ -1577,7 +1565,7 @@ impl Storage {
         height: u32,
     ) -> Result<(PageId, Option<(Key, PageId)>)> {
         let mut pin = self.get_page(pid)?;
-        let page = self.pool[pin.buf as usize].read().unwrap();
+        let page = self.pool[pin.buf as usize].read();
         let mut l: ItemPointer = 0;
         let n = page.get_n_items();
         let mut r = n;
@@ -1594,7 +1582,7 @@ impl Storage {
             // leaf page
             drop(page);
             pin.modify(db, None)?;
-            let mut page = self.pool[pin.buf as usize].write().unwrap();
+            let mut page = self.pool[pin.buf as usize].write();
             if r < n && page.compare_key(r, key) == Ordering::Equal {
                 // replace old value with new one: just remove old one and reinsert new key-value pair
                 page.remove_key(r, true);
@@ -1610,7 +1598,7 @@ impl Storage {
             drop(page);
             let (child, overflow) = self.btree_insert(db, r_child, key, value, height - 1)?;
             pin.modify(db, None)?;
-            let mut page = self.pool[pin.buf as usize].write().unwrap();
+            let mut page = self.pool[pin.buf as usize].write();
             page.set_child(r, child);
             if let Some((key, child)) = overflow {
                 // insert new page before original
@@ -1685,7 +1673,7 @@ impl Storage {
                     let mut level = meta.height;
                     loop {
                         let pin = self.get_page(pid)?;
-                        let page = self.pool[pin.buf as usize].read().unwrap();
+                        let page = self.pool[pin.buf as usize].read();
                         path.stack.push(PagePos { pid, pos: 0 });
                         level -= 1;
                         if level == 0 {
@@ -1705,7 +1693,7 @@ impl Storage {
                     let mut level = meta.height;
                     loop {
                         let pin = self.get_page(pid)?;
-                        let page = self.pool[pin.buf as usize].read().unwrap();
+                        let page = self.pool[pin.buf as usize].read();
                         let pos = page.get_n_items() - 1;
                         level -= 1;
                         path.stack.push(PagePos { pid, pos });
@@ -1756,7 +1744,7 @@ impl Storage {
     //
     fn find(&self, pid: PageId, path: &mut TreePath, key: &Key, height: u32) -> Result<bool> {
         let pin = self.get_page(pid)?;
-        let page = self.pool[pin.buf as usize].read().unwrap();
+        let page = self.pool[pin.buf as usize].read();
         let n = page.get_n_items();
         let mut l: ItemPointer = 0;
         let mut r = n;
@@ -1830,7 +1818,7 @@ impl Storage {
         while !path.stack.is_empty() {
             let top = path.stack.pop().unwrap();
             let pin = self.get_page(top.pid)?;
-            let page = self.pool[pin.buf as usize].read().unwrap();
+            let page = self.pool[pin.buf as usize].read();
             let n_items = page.get_n_items();
             let pos = top.pos + inc;
             if pos < n_items {
@@ -1867,7 +1855,7 @@ impl Storage {
         while !path.stack.is_empty() {
             let top = path.stack.pop().unwrap();
             let pin = self.get_page(top.pid)?;
-            let page = self.pool[pin.buf as usize].read().unwrap();
+            let page = self.pool[pin.buf as usize].read();
             let pos = if top.pos == usize::MAX {
                 page.get_n_items()
             } else {
@@ -1901,7 +1889,7 @@ impl Storage {
     ) -> Result<u64> {
         ensure!(self.test_allocator_bitmap(meta, pid)?);
         let pin = self.get_page(pid)?;
-        let page = self.pool[pin.buf as usize].read().unwrap();
+        let page = self.pool[pin.buf as usize].read();
         let n_items = page.get_n_items();
         let mut count = 0u64;
         if height == 1 {
@@ -1938,7 +1926,7 @@ impl Storage {
         to_upsert: &mut dyn Iterator<Item = Result<(Key, Value)>>,
         to_remove: &mut dyn Iterator<Item = Result<Key>>,
     ) -> Result<()> {
-        let mut db = self.db.write().unwrap(); // prevent concurrent access to the database during update operations (MURSIW)
+        let mut db = self.db.write(); // prevent concurrent access to the database during update operations (MURSIW)
         self.do_updates(&mut db, to_upsert, to_remove)?;
         self.commit(&mut db)
     }
@@ -1947,7 +1935,7 @@ impl Storage {
     /// Traverse B-Tree, check B-Tree invariants and return total number of keys in B-Tree
     ///
     pub fn verify(&self) -> Result<u64> {
-        let db = self.db.read().unwrap();
+        let db = self.db.read();
         let meta = &db.meta;
         ensure!(self.test_allocator_bitmap(meta, 0)?);
         for pid in meta.alloc_pages {
@@ -2068,7 +2056,7 @@ impl Storage {
     /// Get database info
     ///
     pub fn get_database_info(&self) -> DatabaseInfo {
-        let db = self.db.read().unwrap();
+        let db = self.db.read();
         db.get_info()
     }
 
@@ -2076,7 +2064,7 @@ impl Storage {
     /// Get cache info
     ///
     pub fn get_cache_info(&self) -> CacheInfo {
-        let bm = self.buf_mgr.lock().unwrap();
+        let bm = self.buf_mgr.lock();
         CacheInfo {
             used: bm.cached as usize,
             pinned: bm.pinned as usize,
@@ -2087,12 +2075,10 @@ impl Storage {
 
 impl Drop for Storage {
     fn drop(&mut self) {
-        // Avoid poisoned lock
-        if let Ok(mut db) = self.db.write() {
-            // Complete delayed commit
-            if db.is_modified() {
-                self.commit(&mut db).unwrap();
-            }
+        let mut db = self.db.write();
+        // Complete delayed commit
+        if db.is_modified() {
+            self.commit(&mut db).unwrap();
         }
     }
 }
