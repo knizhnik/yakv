@@ -451,9 +451,7 @@ impl PageData {
             data: [0u8; PAGE_SIZE],
         }
     }
-}
 
-impl PageData {
     fn get_offs(&self, ip: ItemPointer) -> usize {
         self.get_u16(PAGE_HEADER_SIZE + ip * 2) as usize
     }
@@ -540,7 +538,7 @@ impl PageData {
     }
 
     fn find_first_zero_bit(&self, offs: usize) -> usize {
-        let bytes = self.data;
+        let bytes = &self.data;
         for i in offs..PAGE_SIZE {
             if bytes[i] != 0xFFu8 {
                 return i * 8 + bytes[i].trailing_ones() as usize;
