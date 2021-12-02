@@ -13,7 +13,10 @@ use std::path::Path;
 
 type PageId = u32; // address of page in the file
 type BufferId = u32; // index of page in buffer cache
-type LSN = u64; // logical serial number: monotonically increased counter of database state changes
+                     // (Sub)transaction identifier: monotonically increased counter of subtransactions
+                     // This identifier is used to detect deteriorate state of iterator and maintaining COW map for subtransactions.
+                     // We compare XIDs only for equality, so wrap-around is not critical (assuming there are no so deteriorated iterators and > 2^32 subtransactions).
+type XID = u32;
 type ItemPointer = usize; // offset within page, actually only 16 bits is enough, but use usize to avoid type casts when used as an index
 
 ///
@@ -53,7 +56,7 @@ enum LookupOp<'a> {
 }
 
 //
-// Operations with alloactor bitmap
+// Operations with allocator bitmap
 //
 enum BitmapOp {
     Prepare,
@@ -70,8 +73,6 @@ pub struct StorageConfig {
     pub cache_size: usize,
     // Do not sync written pages
     pub nosync: bool,
-    //  Prevent concurrent execution of readers and writer
-    pub mursiw: bool,
 }
 
 impl StorageConfig {
@@ -79,7 +80,6 @@ impl StorageConfig {
         StorageConfig {
             cache_size: 128 * 1024, // 1Gb
             nosync: false,
-            mursiw: false,
         }
     }
 }
@@ -105,8 +105,17 @@ pub struct Transaction<'a> {
 }
 
 ///
-/// Read-only transaction for MURSIW mode. If you need concurrent execution of readers and writer,
-/// then use snapshot
+/// Class for taking snapshot of the storage: capturing state of the storage
+/// preventing concurrent changes
+///
+pub struct Snapshot<'a> {
+    storage: &'a Storage,
+    meta: RwLockReadGuard<'a, ShadowMetadata>,
+}
+
+///
+/// Read-only transactions. Unlike snapshot read-only transaction exclude concurrent execution
+/// of write transactions (MURSIW).
 ///
 pub struct ReadOnlyTransaction<'a> {
     storage: &'a Storage,
@@ -114,12 +123,44 @@ pub struct ReadOnlyTransaction<'a> {
 }
 
 ///
-/// Class for taking snapshot of the storage: capturing state of the storage
-/// preventing oncurrent changes
+/// Read-only queries to the storage
 ///
-pub struct Snapshot<'a> {
-    storage: &'a Storage,
-    meta: RwLockReadGuard<'a, Metadata>,
+pub trait Select {
+    ///
+    /// Iterator through pairs in key ascending order.
+    /// Byte-wise comparison is used, to it is up to serializer to enforce proper ordering,
+    /// for example for unsigned integer type big-endian encoding should be used.
+    ///
+    fn iter(&self) -> StorageIterator<'_> {
+        self.range(..)
+    }
+
+    ///
+    /// Lookup key in the storage.
+    ///
+    fn get(&self, key: &Key) -> Result<Option<Value>> {
+        let mut iter = self.range((Included(key), Included(key)));
+        Ok(iter.next().transpose()?.map(|kv| kv.1))
+    }
+
+    ///
+    /// Lookup u32 key in the storage.
+    ///
+    fn get_u32(&self, key: u32) -> Result<Option<Value>> {
+        self.get(&key.to_be_bytes().to_vec())
+    }
+
+    ///
+    /// Lookup u64 key in the storage.
+    ///
+    fn get_u64(&self, key: u64) -> Result<Option<Value>> {
+        self.get(&key.to_be_bytes().to_vec())
+    }
+
+    ///
+    /// Returns bidirectional iterator
+    ///
+    fn range<R: RangeBounds<Key>>(&self, range: R) -> StorageIterator<'_>;
 }
 
 ///
@@ -183,7 +224,7 @@ struct TreePath {
     curr: Option<(Key, Value)>, // current (key,value) pair if any
     result: Option<Result<(Key, Value)>>,
     stack: Vec<PagePos>, // stack of positions in B-Tree
-    lsn: LSN,            // LSN of last operation
+    xid: XID,            // XID of subtransaction when this path was constructed
 }
 
 impl TreePath {
@@ -192,7 +233,7 @@ impl TreePath {
             curr: None,
             result: None,
             stack: Vec::new(),
-            lsn: 0,
+            xid: 0,
         }
     }
 }
@@ -295,12 +336,9 @@ impl<'a> Iterator for StorageIterator<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(meta) = self.meta {
             self.next_locked(meta)
-        } else if self.storage.conf.mursiw {
-            let meta = self.storage.db.read().meta;
-            self.next_locked(&meta)
         } else {
             let meta = self.storage.meta_shadow.read();
-            self.next_locked(&meta)
+            self.next_locked(&meta.snapshot)
         }
     }
 }
@@ -309,14 +347,16 @@ impl<'a> DoubleEndedIterator for StorageIterator<'a> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if let Some(meta) = self.meta {
             self.next_back_locked(meta)
-        } else if self.storage.conf.mursiw {
-            let meta = self.storage.db.read().meta;
-            self.next_back_locked(&meta)
         } else {
             let meta = self.storage.meta_shadow.read();
-            self.next_back_locked(&meta)
+            self.next_back_locked(&meta.snapshot)
         }
     }
+}
+
+struct ShadowMetadata {
+    committed: Metadata, // committed metadata state
+    snapshot: Metadata,  // current metadata snapshot
 }
 
 ///
@@ -325,7 +365,7 @@ impl<'a> DoubleEndedIterator for StorageIterator<'a> {
 ///
 pub struct Storage {
     db: RwLock<Database>,
-    meta_shadow: RwLock<Metadata>, // shdow copy of metadata for concurrent read-only access
+    meta_shadow: RwLock<ShadowMetadata>, // shadow copy of metadata for concurrent read-only access
     buf_mgr: Mutex<BufferManager>,
     busy_events: [Condvar; N_BUSY_EVENTS],
     pool: Vec<RwLock<PageData>>,
@@ -369,7 +409,8 @@ struct Metadata {
     used: PageId,                          // number of used database pages
     root: PageId,                          // B-Tree root page
     height: u32,                           // height of B-Tree
-    lsn: u64,                              // update counter
+    xid: XID,                              // current subtransaction identifier
+    _reserved: u32,                        // for future use
     alloc_pages: [PageId; N_BITMAP_PAGES], // allocator bitmap pages
 }
 
@@ -382,17 +423,32 @@ impl Metadata {
             std::mem::transmute::<[u8; PAGE_SIZE], Metadata>(buf[0..PAGE_SIZE].try_into().unwrap())
         }
     }
+    // Update metadata fields needed for snapshot operations
+    fn update(&mut self, curr: &Metadata) {
+        self.root = curr.root;
+        self.height = curr.height;
+        self.xid = curr.xid;
+    }
+}
+
+//
+// Copy-on-write map entry.
+// Key of COW hash map is new pid.
+//
+struct CowEntry {
+    pid: PageId, // original page identifier (or 0 for new page)
+    xid: XID,    // XID of subtransaction created this entry
 }
 
 //
 // Database shared state
 //
 struct Database {
-    meta: Metadata,                   // main copy of database metadata
-    alloc_page: usize,                // index of current allocator internal page
-    alloc_page_pos: usize,            // allocator current position in internal page
-    cow_map: HashMap<PageId, PageId>, // copy-on-write map: we have to store this mapping to avoid creation of redundant copies
-    pending_deletes: Vec<PageId>, // we can no immedately delete pages, because deleted page can be reused and can not be stored in `cow` map
+    meta: Metadata,                     // main copy of database metadata
+    alloc_page: usize,                  // index of current allocator internal page
+    alloc_page_pos: usize,              // allocator current position in internal page
+    cow_map: HashMap<PageId, CowEntry>, // copy-on-write map: we have to store this mapping to avoid creation of redundant copies
+    pending_deletes: Vec<PageId>, // we can no immediately delete pages, because deleted page can be reused and can not be stored in `cow` map
     n_alloc_pages: u64,           // number of allocated pages since session start
     n_free_pages: u64,            // number of deallocated pages since session start
     n_committed_txns: u64,        // number of committed transactions
@@ -795,8 +851,13 @@ impl BufferManager {
     //
     // Change pid for copied buffer
     //
-    fn copy_on_write(&mut self, id: BufferId, new_pid: PageId) -> Result<(BufferId, PageId)> {
-        if self.buffers[id as usize].access_count == 1 {
+    fn copy_on_write(
+        &mut self,
+        id: BufferId,
+        new_pid: PageId,
+        try_reuse_buffer: bool,
+    ) -> Result<(BufferId, PageId)> {
+        if try_reuse_buffer && self.buffers[id as usize].access_count == 1 {
             // If we are the only user of the buffer, we can replace it's PID in place.
             self.remove(id);
             self.forget_buffer(new_pid);
@@ -805,7 +866,7 @@ impl BufferManager {
             Ok((id, 0))
         } else {
             // otherwise create new buffer
-            self.get_buffer(new_pid)
+            self.new_buffer(new_pid)
         }
     }
 
@@ -919,42 +980,55 @@ impl<'a> PageGuard<'a> {
     fn modify(&mut self, db: &mut Database, bitmap_page: Option<usize>) -> Result<()> {
         let mut bm = self.storage.buf_mgr.lock();
         let old_buf = self.buf;
-        if bm.modify_buffer(old_buf) {
-            // first update of the page
-            let old_pid = bm.buffers[old_buf as usize].pid;
-            drop(bm);
-            // Check if it is already copied
-            if !db.cow_map.contains_key(&old_pid) {
-                // Create copy
-                let new_pid = self.storage.allocate_page(db)?;
-                db.cow_map.insert(new_pid, old_pid); // remember COW mapping
-                self.pid = new_pid;
-                let mgr = &self.storage.buf_mgr;
-                let (new_buf, evicted_pid) = mgr.lock().copy_on_write(old_buf, new_pid)?;
-                if evicted_pid != 0 {
-                    // dirty page was evicted
-                    let page = self.storage.pool[new_buf as usize].read();
-                    self.storage
-                        .file
-                        .write_all_at(&page.data, evicted_pid as u64 * PAGE_SIZE as u64)?;
-                }
-                if new_buf != old_buf {
-                    // Copy page content to the new buffer
-                    let mut dst = self.storage.pool[new_buf as usize].write();
-                    let src = self.storage.pool[old_buf as usize].read();
-                    *dst = *src;
-                    let mut bm = mgr.lock();
-                    bm.undirty_buffer(old_buf);
-                    bm.release_buffer(old_buf);
-                    assert!(bm.modify_buffer(new_buf));
-                    self.buf = new_buf;
-                }
-                // Prevent infinite recursion
-                if let Some(alloc_page) = bitmap_page {
-                    db.meta.alloc_pages[alloc_page] = new_pid;
-                }
-                self.storage.prepare_free_page(db, old_pid)?; // prepare deallocation of original page
+        let old_pid = bm.buffers[old_buf as usize].pid;
+        let just_modified = bm.modify_buffer(old_buf);
+        drop(bm);
+
+        // Check if there is not mapping for this page in this subtransaction,
+        // Allocator bitmap pages are not accessed by read-only queries, so there is no need to clone
+        // bitmap pages for subtrasactions.
+        if db.cow_map.get(&old_pid).map_or(just_modified, |entry| {
+            entry.xid != db.meta.xid && !bitmap_page.is_some()
+        }) {
+            // Create copy
+            let new_pid = self.storage.allocate_page(db)?;
+            db.cow_map.insert(
+                new_pid,
+                CowEntry {
+                    pid: old_pid,
+                    xid: db.meta.xid,
+                },
+            ); // remember COW mapping
+            self.pid = new_pid;
+            let mgr = &self.storage.buf_mgr;
+            let (new_buf, evicted_pid) =
+                mgr.lock().copy_on_write(old_buf, new_pid, just_modified)?;
+            if evicted_pid != 0 {
+                // dirty page was evicted
+                let page = self.storage.pool[new_buf as usize].read();
+                self.storage
+                    .file
+                    .write_all_at(&page.data, evicted_pid as u64 * PAGE_SIZE as u64)?;
             }
+            if new_buf != old_buf {
+                // Copy page content to the new buffer
+                let mut dst = self.storage.pool[new_buf as usize].write();
+                let src = self.storage.pool[old_buf as usize].read();
+                *dst = *src;
+                let mut bm = mgr.lock();
+                debug_assert!(bm.buffers[new_buf as usize].state == PAGE_RAW);
+                if just_modified {
+                    bm.undirty_buffer(old_buf);
+                }
+                bm.release_buffer(old_buf);
+                assert!(bm.modify_buffer(new_buf));
+                self.buf = new_buf;
+            }
+            // Prevent infinite recursion
+            if let Some(alloc_page) = bitmap_page {
+                db.meta.alloc_pages[alloc_page] = new_pid;
+            }
+            self.storage.prepare_free_page(db, old_pid)?; // prepare deallocation of original page
         }
         Ok(())
     }
@@ -1116,7 +1190,13 @@ impl Storage {
     // Allocate buffer for new page
     //
     fn new_page_at(&self, db: &mut Database, pid: PageId) -> Result<PageGuard<'_>> {
-        db.cow_map.insert(pid, 0); // remember new page in COW map to avoid its cloning
+        db.cow_map.insert(
+            pid,
+            CowEntry {
+                pid: 0,
+                xid: db.meta.xid,
+            },
+        ); // remember new page in COW map to avoid its cloning
 
         let mut bm = self.buf_mgr.lock();
 
@@ -1163,6 +1243,7 @@ impl Storage {
             }
         } else if (bm.buffers[buf as usize].state & PAGE_RAW) != 0 {
             // Read page
+            debug_assert!(bm.buffers[buf as usize].state == PAGE_RAW);
             bm.buffers[buf as usize].state = PAGE_BUSY;
             drop(bm); // read page without holding lock
             {
@@ -1175,6 +1256,7 @@ impl Storage {
                 // Somebody is waiting for us
                 self.busy_events[buf as usize % N_BUSY_EVENTS].notify_all();
             }
+            debug_assert!((bm.buffers[buf as usize].state & !(PAGE_BUSY | PAGE_WAIT)) == 0);
             bm.buffers[buf as usize].state = 0;
         }
         Ok(PageGuard {
@@ -1185,26 +1267,13 @@ impl Storage {
     }
 
     ///
-    /// Take database snasphot for providing repeatable reads.
+    /// Take database snapshot for providing repeatable reads.
     /// Snapshot blocks commit of update transaction.
     ///
     pub fn take_snapshot(&self) -> Snapshot<'_> {
         Snapshot {
             storage: self,
             meta: self.meta_shadow.read(),
-        }
-    }
-
-    ///
-    /// Start update transaction. Transaction should be either committed,
-    /// either aborted. If transaction is not explicitly committed,
-    /// then it is implicitly aborted when left out of scope.
-    ///
-    pub fn start_transaction(&self) -> Transaction<'_> {
-        Transaction {
-            status: TransactionStatus::InProgress,
-            storage: self,
-            db: self.db.write(),
         }
     }
 
@@ -1219,8 +1288,17 @@ impl Storage {
         }
     }
 
-    fn update_snapshot(&self, db: &Database) {
-        *self.meta_shadow.write() = db.meta;
+    ///
+    /// Start update transaction. Transaction should be either committed,
+    /// either aborted. If transaction is not explicitly committed,
+    /// then it is implicitly aborted when left out of scope.
+    ///
+    pub fn start_transaction(&self) -> Transaction<'_> {
+        Transaction {
+            status: TransactionStatus::InProgress,
+            storage: self,
+            db: self.db.write(),
+        }
     }
 
     fn commit(&self, db: &mut Database) -> Result<()> {
@@ -1249,7 +1327,7 @@ impl Storage {
             let orig: Vec<PageId> = db
                 .cow_map
                 .iter()
-                .map(|(_new, old)| *old)
+                .map(|(_new, entry)| entry.pid)
                 .filter(|pid| *pid != 0)
                 .collect();
             for pid in orig {
@@ -1262,7 +1340,7 @@ impl Storage {
             if !self.conf.nosync {
                 self.file.sync_all()?;
             }
-            db.meta.lsn += 1;
+            db.meta.xid = db.meta.xid.wrapping_add(1);
             let meta = db.meta.pack();
             self.file.write_all_at(&meta, 0)?;
             if !self.conf.nosync {
@@ -1271,8 +1349,9 @@ impl Storage {
 
             db.n_committed_txns += 1;
 
-            // Let all other transactions see our changes
-            self.update_snapshot(&db);
+            let mut meta_shadow = self.meta_shadow.write();
+            meta_shadow.committed = db.meta;
+            meta_shadow.snapshot.update(&db.meta);
         }
         Ok(())
     }
@@ -1312,13 +1391,18 @@ impl Storage {
             // But it is not enough to throw away just dirty buffers,
             // some modified buffers can already be save on the disk.
             // So we have to do loop through COW map
-            let mut cow_map: HashMap<PageId, PageId> = HashMap::new();
+            let mut cow_map: HashMap<PageId, CowEntry> = HashMap::new();
             std::mem::swap(&mut db.cow_map, &mut cow_map);
-            for (new, _old) in &cow_map {
-                bm.forget_buffer(*new);
+            for (new_pid, _entry) in &cow_map {
+                bm.forget_buffer(*new_pid);
             }
-            // restore old metadata state
-            db.meta = *self.meta_shadow.read();
+            // restore old metadata state but preserve current XID
+            let mut meta_shadow = self.meta_shadow.write();
+            let xid = db.meta.xid;
+            db.meta = meta_shadow.committed;
+            db.meta.xid = xid;
+            meta_shadow.snapshot.update(&db.meta);
+
             db.n_aborted_txns += 1;
             db.pending_deletes.clear();
         }
@@ -1354,7 +1438,8 @@ impl Storage {
                 used: 1,
                 root: 0,
                 height: 0,
-                lsn: 0,
+                xid: 0,
+                _reserved: 0,
                 alloc_pages: [0u32; N_BITMAP_PAGES],
             };
             let metadata = meta.pack();
@@ -1378,7 +1463,10 @@ impl Storage {
                 .collect(),
             file,
             conf,
-            meta_shadow: RwLock::new(meta),
+            meta_shadow: RwLock::new(ShadowMetadata {
+                snapshot: meta,
+                committed: meta,
+            }),
             db: RwLock::new(Database {
                 meta,
                 alloc_page: 0,
@@ -1678,7 +1766,7 @@ impl Storage {
                         level -= 1;
                         if level == 0 {
                             path.curr = Some(page.get_item(0));
-                            path.lsn = meta.lsn;
+                            path.xid = meta.xid;
                             break;
                         } else {
                             pid = page.get_child(0)
@@ -1699,7 +1787,7 @@ impl Storage {
                         path.stack.push(PagePos { pid, pos });
                         if level == 0 {
                             path.curr = Some(page.get_item(pos));
-                            path.lsn = meta.lsn;
+                            path.xid = meta.xid;
                             break;
                         } else {
                             pid = page.get_child(pos)
@@ -1708,18 +1796,18 @@ impl Storage {
                 }
             }
             LookupOp::Next => {
-                if path.lsn == meta.lsn || self.reconstruct_path(path, meta)? {
+                if path.xid == meta.xid || self.reconstruct_path(path, meta)? {
                     self.move_forward(path, meta.height)?;
                 }
             }
             LookupOp::Prev => {
-                if path.lsn == meta.lsn || self.reconstruct_path(path, meta)? {
+                if path.xid == meta.xid || self.reconstruct_path(path, meta)? {
                     self.move_backward(path, meta.height)?;
                 }
             }
             LookupOp::GreaterOrEqual(key) => {
                 if meta.root != 0 && self.find(meta.root, path, &key, meta.height)? {
-                    path.lsn = meta.lsn;
+                    path.xid = meta.xid;
                 }
             }
         }
@@ -1798,7 +1886,7 @@ impl Storage {
             if self.find(meta.root, path, &key, meta.height)? {
                 if let Some((ge_key, _value)) = &path.curr {
                     if ge_key == key {
-                        path.lsn = meta.lsn;
+                        path.xid = meta.xid;
                         debug_assert!(path.stack.len() == meta.height as usize);
                         return Ok(true);
                     }
@@ -1926,7 +2014,7 @@ impl Storage {
         to_upsert: &mut dyn Iterator<Item = Result<(Key, Value)>>,
         to_remove: &mut dyn Iterator<Item = Result<Key>>,
     ) -> Result<()> {
-        let mut db = self.db.write(); // prevent concurrent access to the database during update operations (MURSIW)
+        let mut db = self.db.write(); // prevent concurrent modification of the database (MURSIW)
         self.do_updates(&mut db, to_upsert, to_remove)?;
         self.commit(&mut db)
     }
@@ -2008,51 +2096,6 @@ impl Storage {
     }
 
     ///
-    /// Iterator through pairs in key ascending order.
-    /// Byte-wise comparison is used, to it is up to serializer to enforce proper ordering,
-    /// for example for unsigned integer type big-endian encoding should be used.
-    ///
-    pub fn iter(&self) -> StorageIterator<'_> {
-        self.range(..)
-    }
-
-    ///
-    /// Lookup key in the storage.
-    ///
-    pub fn get(&self, key: &Key) -> Result<Option<Value>> {
-        let mut iter = self.range((Included(key), Included(key)));
-        Ok(iter.next().transpose()?.map(|kv| kv.1))
-    }
-
-    ///
-    /// Lookup u32 key in the storage.
-    ///
-    pub fn get_u32(&self, key: u32) -> Result<Option<Value>> {
-        self.get(&key.to_be_bytes().to_vec())
-    }
-
-    ///
-    /// Lookup u64 key in the storage.
-    ///
-    pub fn get_u64(&self, key: u64) -> Result<Option<Value>> {
-        self.get(&key.to_be_bytes().to_vec())
-    }
-
-    ///
-    /// Returns bidirectional iterator
-    ///
-    pub fn range<R: RangeBounds<Key>>(&self, range: R) -> StorageIterator<'_> {
-        StorageIterator {
-            storage: &self,
-            meta: None,
-            from: range.start_bound().cloned(),
-            till: range.end_bound().cloned(),
-            left: TreePath::new(),
-            right: TreePath::new(),
-        }
-    }
-
-    ///
     /// Get database info
     ///
     pub fn get_database_info(&self) -> DatabaseInfo {
@@ -2073,6 +2116,22 @@ impl Storage {
     }
 }
 
+impl Select for Storage {
+    ///
+    /// Returns bidirectional iterator
+    ///
+    fn range<R: RangeBounds<Key>>(&self, range: R) -> StorageIterator<'_> {
+        StorageIterator {
+            storage: &self,
+            meta: None,
+            from: range.start_bound().cloned(),
+            till: range.end_bound().cloned(),
+            left: TreePath::new(),
+            right: TreePath::new(),
+        }
+    }
+}
+
 impl Drop for Storage {
     fn drop(&mut self) {
         let mut db = self.db.write();
@@ -2083,92 +2142,11 @@ impl Drop for Storage {
     }
 }
 
-impl<'a> Snapshot<'_> {
-    ///
-    /// Iterator through pairs in key ascending order.
-    /// Byte-wise comparison is used, to it is up to serializer to enforce proper ordering,
-    /// for example for unsigned integer type big-endian encoding should be used.
-    ///
-    pub fn iter(&self) -> StorageIterator<'_> {
-        self.range(..)
-    }
-
-    ///
-    /// Lookup key in the storage.
-    ///
-    pub fn get(&self, key: &Key) -> Result<Option<Value>> {
-        let mut iter = self.range((Included(key), Included(key)));
-        Ok(iter.next().transpose()?.map(|kv| kv.1))
-    }
-
-    ///
-    /// Lookup u32 key in the storage.
-    ///
-    pub fn get_u32(&self, key: u32) -> Result<Option<Value>> {
-        self.get(&key.to_be_bytes().to_vec())
-    }
-
-    ///
-    /// Lookup u64 key in the storage.
-    ///
-    pub fn get_u64(&self, key: u64) -> Result<Option<Value>> {
-        self.get(&key.to_be_bytes().to_vec())
-    }
-
-    ///
-    /// Returns bidirectional iterator
-    ///
-    pub fn range<R: RangeBounds<Key>>(&self, range: R) -> StorageIterator<'_> {
+impl<'a> Select for Snapshot<'_> {
+    fn range<R: RangeBounds<Key>>(&self, range: R) -> StorageIterator<'_> {
         StorageIterator {
             storage: self.storage,
-            meta: Some(&self.meta),
-            from: range.start_bound().cloned(),
-            till: range.end_bound().cloned(),
-            left: TreePath::new(),
-            right: TreePath::new(),
-        }
-    }
-}
-
-impl<'a> ReadOnlyTransaction<'_> {
-    ///
-    /// Iterator through pairs in key ascending order.
-    /// Byte-wise comparison is used, to it is up to serializer to enforce proper ordering,
-    /// for example for unsigned integer type big-endian encoding should be used.
-    ///
-    pub fn iter(&self) -> StorageIterator<'_> {
-        self.range(..)
-    }
-
-    ///
-    /// Lookup key in the storage.
-    ///
-    pub fn get(&self, key: &Key) -> Result<Option<Value>> {
-        let mut iter = self.range((Included(key), Included(key)));
-        Ok(iter.next().transpose()?.map(|kv| kv.1))
-    }
-
-    ///
-    /// Lookup u32 key in the storage.
-    ///
-    pub fn get_u32(&self, key: u32) -> Result<Option<Value>> {
-        self.get(&key.to_be_bytes().to_vec())
-    }
-
-    ///
-    /// Lookup u64 key in the storage.
-    ///
-    pub fn get_u64(&self, key: u64) -> Result<Option<Value>> {
-        self.get(&key.to_be_bytes().to_vec())
-    }
-
-    ///
-    /// Returns bidirectional iterator
-    ///
-    pub fn range<R: RangeBounds<Key>>(&self, range: R) -> StorageIterator<'_> {
-        StorageIterator {
-            storage: self.storage,
-            meta: Some(&self.db.meta),
+            meta: Some(&self.meta.snapshot),
             from: range.start_bound().cloned(),
             till: range.end_bound().cloned(),
             left: TreePath::new(),
@@ -2188,15 +2166,26 @@ impl<'a> Transaction<'_> {
     }
 
     ///
-    /// Delay commit of transaction.
-    /// This method can be used only in MURSIW mode
+    /// Commit subtransaction. Allow other transactions to see changes made by this subtransaction.
+    /// Changes will be committed only when transaction is committed.
+    /// Rollback cause abort of all subtransactins.
     ///
-    pub fn delay(mut self) -> Result<()> {
-        ensure!(self.storage.conf.mursiw); // supported only in MURSIW mode
-        self.db.meta.lsn += 1;
+    pub fn subcommit(mut self) -> Result<()> {
+        self.db.meta.xid = self.db.meta.xid.wrapping_add(1);
+        let mut meta = self.storage.meta_shadow.write();
+        meta.snapshot.update(&self.db.meta);
         // mark transaction as committed to prevent implicit rollback by destructor
         self.status = TransactionStatus::Committed;
         Ok(())
+    }
+
+    ///
+    /// Delay transaction commit. This method can be used to group several transactions to reduce commit overhead.
+    /// Read-only transactions will see changes done buy this commit. But them are not be visible for selects in snapshot.
+    ///
+    pub fn delay(mut self) {
+        // mark transaction as committed to prevent implicit rollback by destructor
+        self.status = TransactionStatus::Committed;
     }
 
     ///
@@ -2254,51 +2243,6 @@ impl<'a> Transaction<'_> {
     }
 
     ///
-    /// Iterator through pairs in key ascending order.
-    /// Byte-wise comparison is used, to it is up to serializer to enforce proper ordering,
-    /// for example for unsigned integer type big-endian encoding should be used.
-    ///
-    pub fn iter(&self) -> StorageIterator<'_> {
-        self.range(..)
-    }
-
-    ///
-    /// Lookup key in the storage.
-    ///
-    pub fn get(&self, key: &Key) -> Result<Option<Value>> {
-        let mut iter = self.range((Included(key), Included(key)));
-        Ok(iter.next().transpose()?.map(|kv| kv.1))
-    }
-
-    ///
-    /// Lookup u32 key in the storage.
-    ///
-    pub fn get_u32(&self, key: u32) -> Result<Option<Value>> {
-        self.get(&key.to_be_bytes().to_vec())
-    }
-
-    ///
-    /// Lookup u64 key in the storage.
-    ///
-    pub fn get_u64(&self, key: u64) -> Result<Option<Value>> {
-        self.get(&key.to_be_bytes().to_vec())
-    }
-
-    ///
-    /// Returns bidirectional iterator
-    ///
-    pub fn range<R: RangeBounds<Key>>(&self, range: R) -> StorageIterator<'_> {
-        StorageIterator {
-            storage: self.storage,
-            meta: Some(&self.db.meta),
-            from: range.start_bound().cloned(),
-            till: range.end_bound().cloned(),
-            left: TreePath::new(),
-            right: TreePath::new(),
-        }
-    }
-
-    ///
     /// Get database info
     ///
     pub fn get_database_info(&self) -> DatabaseInfo {
@@ -2313,10 +2257,42 @@ impl<'a> Transaction<'_> {
     }
 }
 
+impl<'a> Select for Transaction<'_> {
+    ///
+    /// Returns bidirectional iterator
+    ///
+    fn range<R: RangeBounds<Key>>(&self, range: R) -> StorageIterator<'_> {
+        StorageIterator {
+            storage: self.storage,
+            meta: Some(&self.db.meta),
+            from: range.start_bound().cloned(),
+            till: range.end_bound().cloned(),
+            left: TreePath::new(),
+            right: TreePath::new(),
+        }
+    }
+}
+
 impl<'a> Drop for Transaction<'a> {
     fn drop(&mut self) {
         if self.status == TransactionStatus::InProgress {
             self.storage.rollback(&mut self.db);
+        }
+    }
+}
+
+impl<'a> Select for ReadOnlyTransaction<'_> {
+    ///
+    /// Returns bidirectional iterator
+    ///
+    fn range<R: RangeBounds<Key>>(&self, range: R) -> StorageIterator<'_> {
+        StorageIterator {
+            storage: self.storage,
+            meta: Some(&self.db.meta),
+            from: range.start_bound().cloned(),
+            till: range.end_bound().cloned(),
+            left: TreePath::new(),
+            right: TreePath::new(),
         }
     }
 }

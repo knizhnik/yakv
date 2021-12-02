@@ -22,8 +22,8 @@ then it is implicitly aborted.
 
 **YAKV** supports multi-threaded access to the storage. All threads can share single storage instance (you should use Arc for it).
 Storage implementation is thread safe and all methods are immutable, so you can call them concurrently from different threads.
-But only one thread can update database at each moment of time: other readers or writers will be blocked until the end of transaction.
-Readers can work in parallel.
+Only one thread can update storage at each moment of time, but multiple threads can read it.
+Readers can work concurrently with writer observing database state before start of write transactions.
 
 **YAKV** requires key and value to be a vector of bytes. If you want to store other types, you need to serialize them first.
 If you need to preserve natural comparison order for underlying type, then you will have to use proper serializer.
@@ -32,10 +32,25 @@ to make vector of bytes comparison produce the same result as comparison of two 
 For signed or floating point types writing such serializer may require more efforts.
 
 **YAKV** uses copy-on-write (COW) mechanism to provide atomic transactions.
-To guarantee durability and consincy of committed data, it performs two `fsync` system calls on each commit.
-It adds significant performance penalty especially for small transaction as (inserting just one pair).
+To guarantee durability and conscience of committed data, it performs two `fsync` system calls on each commit.
+It adds significant performance penalty especially for small transaction (inserting just one pair).
 But without fsync database can be corrupted in case of abnormal program termination or power failure.
 To disable fsync, set `nosync=true` in config.
+
+COW mechanism allows to eliminate write-ahead-logging (WAL). But commit of transaction requires two syncs: we first need to ensure
+that new version of the database is persisted and then atomically update database metadata.
+So performance on short transactions will be worse than with WAL. But for long transactions COW mechanism will be more efficient
+because it avoid double copying of data. So the most efficient way is to perform changes by means of large (several megabytes) transactions
+at application level (`start_transaction()` method). But it is not always possible, because results of updates may be needed by other read-only transactions.
+**YAKV** provides two ways of grouping several transactions:
+
+1. Subtransactions. You can finish transaction with `subcommit()` method. It cause subtransaction commit. Other transactions will see results
+of this transaction. But this changes becomes durable only once transaction is committed. Rollback aborts all subtransactions.
+2. Delayed commit. If transaction is finished with `delay()` method, then changes will not be visible in read-only snapshots.
+But them are visible for other write or read-only transactions. Read-only transaction is started by `read_only_transaction()` method and is executed in
+MURSIW (multiple-readers-single-writer) mode. Read-only transaction can not be executed concurrently with write transaction.
+So copy-on-writes have to be used to provide isolation. This is why MURSIW mode with delayed transactions can be faster than standard mode with snapshots and subtransactions, allowing concurrent
+execution of readers and writer.
 
 Below is an example of **YAKV** usage":
 
@@ -107,7 +122,7 @@ store.close()?;
 
 Performance comparison:
 
-Below are results (msec: smaller is better) of two benchamrks.
+Below are results (msec: smaller is better) of two benchmarks.
 
 SwayDB benchmark: insertion 1M records with 8 byte key and 8 byte value.
 
