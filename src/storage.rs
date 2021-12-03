@@ -46,6 +46,7 @@ const PAGE_RAW: u16 = 1; // buffer content is uninitialized
 const PAGE_BUSY: u16 = 2; // buffer is loaded for the disk
 const PAGE_DIRTY: u16 = 4; // buffer was updates
 const PAGE_WAIT: u16 = 8; // some thread waits until buffer is loaded
+const PAGE_OVERWRITTEN: u16 = 16; // page was overwritten by subtransaction
 
 enum LookupOp<'a> {
     First,
@@ -744,6 +745,18 @@ impl PageData {
 }
 
 impl BufferManager {
+	fn get_buffer_pid(&self, id: BufferId) -> PageId{
+		self.buffers[id as usize].pid
+	}
+
+	fn get_buffer_state(&self, id: BufferId) -> u16 {
+		self.buffers[id as usize].state
+	}
+
+	fn set_buffer_state(&mut self, id: BufferId, state: u16) {
+		self.buffers[id as usize].state = state
+	}
+
     //
     // Link buffer to the head of LRU list (make it acceptable for eviction)
     //
@@ -866,7 +879,11 @@ impl BufferManager {
             Ok((id, 0))
         } else {
             // otherwise create new buffer
-            self.new_buffer(new_pid)
+            let (buf, evicted_pid) = self.new_buffer(new_pid)?;
+			if !try_reuse_buffer { // dirty page was copied
+				self.buffers[id as usize].state |= PAGE_OVERWRITTEN;
+			}
+			Ok((buf, evicted_pid))
         }
     }
 
@@ -980,7 +997,7 @@ impl<'a> PageGuard<'a> {
     fn modify(&mut self, db: &mut Database, bitmap_page: Option<usize>) -> Result<()> {
         let mut bm = self.storage.buf_mgr.lock();
         let old_buf = self.buf;
-        let old_pid = bm.buffers[old_buf as usize].pid;
+        let old_pid = bm.get_buffer_pid(old_buf);
         let just_modified = bm.modify_buffer(old_buf);
         drop(bm);
 
@@ -992,10 +1009,11 @@ impl<'a> PageGuard<'a> {
         }) {
             // Create copy
             let new_pid = self.storage.allocate_page(db)?;
+			let orig_pid = if just_modified { old_pid } else { 0 };
             db.cow_map.insert(
                 new_pid,
                 CowEntry {
-                    pid: old_pid,
+                    pid: orig_pid,
                     xid: db.meta.xid,
                 },
             ); // remember COW mapping
@@ -1016,7 +1034,7 @@ impl<'a> PageGuard<'a> {
                 let src = self.storage.pool[old_buf as usize].read();
                 *dst = *src;
                 let mut bm = mgr.lock();
-                debug_assert!(bm.buffers[new_buf as usize].state == PAGE_RAW);
+                debug_assert!(bm.get_buffer_state(new_buf) == PAGE_RAW);
                 if just_modified {
                     bm.undirty_buffer(old_buf);
                 }
@@ -1044,6 +1062,28 @@ impl<'a> Drop for PageGuard<'a> {
 // Storage internal methods implementations
 //
 impl Storage {
+	//
+	// Remove dirty copy-on-write pages overwritten by completed subtransaction.
+	//
+	fn remove_redundand_copies(&self, db: &mut Database) -> Result<()> {
+		let mut overwritten_pages : Vec<PageId>;
+		{
+			let bm: &mut BufferManager = &mut self.buf_mgr.lock();
+			let overwritten_buffers: Vec<BufferId> = bm.dirty_buffers.iter().filter(|&&buf| (bm.get_buffer_state(buf) & PAGE_OVERWRITTEN) != 0).map(|&buf| buf).collect();
+			overwritten_pages = Vec::with_capacity(overwritten_buffers.len());
+			for buf in overwritten_buffers {
+				assert!(bm.buffers[buf as usize].access_count == 0);
+				overwritten_pages.push(bm.get_buffer_pid(buf));
+                bm.undirty_buffer(buf);
+				bm.throw_buffer(buf);
+			}
+		}
+		for pid in overwritten_pages {
+			self.free_page(db, pid)?;
+		}
+		Ok(())
+	}
+
     //
     // Allocate page
     //
@@ -1224,7 +1264,7 @@ impl Storage {
     fn get_page(&self, pid: PageId) -> Result<PageGuard<'_>> {
         let mut bm = self.buf_mgr.lock();
         let (buf, evicted_pid) = bm.get_buffer(pid)?;
-        let state = bm.buffers[buf as usize].state;
+        let state = bm.get_buffer_state(buf);
         if evicted_pid != 0 {
             // dirty page was evicted
             let page = self.pool[buf as usize].read();
@@ -1233,18 +1273,18 @@ impl Storage {
         }
         if (state & PAGE_BUSY) != 0 {
             // Some other thread is loading buffer: just wait until it done
-            bm.buffers[buf as usize].state |= PAGE_WAIT;
+            bm.set_buffer_state(buf, state | PAGE_WAIT);
             loop {
-                debug_assert!((bm.buffers[buf as usize].state & PAGE_WAIT) != 0);
+                debug_assert!((bm.get_buffer_state(buf) & PAGE_WAIT) != 0);
                 self.busy_events[buf as usize % N_BUSY_EVENTS].wait(&mut bm);
-                if (bm.buffers[buf as usize].state & PAGE_BUSY) == 0 {
+                if (bm.get_buffer_state(buf) & PAGE_BUSY) == 0 {
                     break;
                 }
             }
-        } else if (bm.buffers[buf as usize].state & PAGE_RAW) != 0 {
+        } else if (state & PAGE_RAW) != 0 {
             // Read page
-            debug_assert!(bm.buffers[buf as usize].state == PAGE_RAW);
-            bm.buffers[buf as usize].state = PAGE_BUSY;
+            debug_assert!(state == PAGE_RAW);
+            bm.set_buffer_state(buf, PAGE_BUSY);
             drop(bm); // read page without holding lock
             {
                 let mut page = self.pool[buf as usize].write();
@@ -1252,12 +1292,12 @@ impl Storage {
                     .read_exact_at(&mut page.data, pid as u64 * PAGE_SIZE as u64)?;
             }
             bm = self.buf_mgr.lock();
-            if (bm.buffers[buf as usize].state & PAGE_WAIT) != 0 {
+            if (bm.get_buffer_state(buf) & PAGE_WAIT) != 0 {
                 // Somebody is waiting for us
                 self.busy_events[buf as usize % N_BUSY_EVENTS].notify_all();
             }
-            debug_assert!((bm.buffers[buf as usize].state & !(PAGE_BUSY | PAGE_WAIT)) == 0);
-            bm.buffers[buf as usize].state = 0;
+            debug_assert!((bm.get_buffer_state(buf) & !(PAGE_BUSY | PAGE_WAIT)) == 0);
+            bm.set_buffer_state(buf, 0);
         }
         Ok(PageGuard {
             buf,
@@ -1383,7 +1423,7 @@ impl Storage {
             // Just throw away all dirty buffers from buffer cache to force reloading of original pages
             for i in 0..bm.dirty_buffers.len() {
                 let buf = bm.dirty_buffers[i];
-                debug_assert!((bm.buffers[buf as usize].state & PAGE_DIRTY) != 0);
+                debug_assert!((bm.get_buffer_state(buf) & PAGE_DIRTY) != 0);
                 bm.throw_buffer(buf);
             }
             bm.dirty_buffers.clear();
@@ -2174,9 +2214,10 @@ impl<'a> Transaction<'_> {
         self.db.meta.xid = self.db.meta.xid.wrapping_add(1);
         let mut meta = self.storage.meta_shadow.write();
         meta.snapshot.update(&self.db.meta);
+		self.storage.remove_redundand_copies(&mut self.db)?;
         // mark transaction as committed to prevent implicit rollback by destructor
         self.status = TransactionStatus::Committed;
-        Ok(())
+		Ok(())
     }
 
     ///
