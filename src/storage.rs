@@ -10,8 +10,11 @@ use std::ops::Bound::*;
 use std::ops::{Bound, RangeBounds};
 use std::os::unix::prelude::FileExt as UnixFileExt;
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
+use tracing::*;
 
 type PageId = u32; // address of page in the file
+type PageState = u16; // page state bit mask
 type BufferId = u32; // index of page in buffer cache
                      // (Sub)transaction identifier: monotonically increased counter of subtransactions
                      // This identifier is used to detect deteriorate state of iterator and maintaining COW map for subtransactions.
@@ -46,7 +49,6 @@ const PAGE_RAW: u16 = 1; // buffer content is uninitialized
 const PAGE_BUSY: u16 = 2; // buffer is loaded for the disk
 const PAGE_DIRTY: u16 = 4; // buffer was updates
 const PAGE_WAIT: u16 = 8; // some thread waits until buffer is loaded
-const PAGE_OVERWRITTEN: u16 = 16; // page was overwritten by subtransaction
 
 enum LookupOp<'a> {
     First,
@@ -371,6 +373,7 @@ pub struct Storage {
     busy_events: [Condvar; N_BUSY_EVENTS],
     pool: Vec<RwLock<PageData>>,
     file: File,
+    n_written_pages: AtomicU64,
     conf: StorageConfig,
 }
 
@@ -390,7 +393,7 @@ struct PageHeader {
     list: L2List,          // LRU l2-list
     dirty_index: BufferId, // index in dirty_pages vector
     access_count: u16,
-    state: u16, // bitmask of PAGE_RAW, PAGE_DIRTY, ...
+    state: PageState, // bitmask of PAGE_RAW, PAGE_DIRTY, ...
 }
 
 impl PageHeader {
@@ -450,10 +453,12 @@ struct Database {
     alloc_page_pos: usize,              // allocator current position in internal page
     cow_map: HashMap<PageId, CowEntry>, // copy-on-write map: we have to store this mapping to avoid creation of redundant copies
     pending_deletes: Vec<PageId>, // we can no immediately delete pages, because deleted page can be reused and can not be stored in `cow` map
+    overwritten_pages: Vec<PageId>, // overwritten page copies created by subtransactions
     n_alloc_pages: u64,           // number of allocated pages since session start
     n_free_pages: u64,            // number of deallocated pages since session start
-    n_committed_txns: u64,        // number of committed transactions
+    n_committed_txns: u64,        // number of committed transactions[
     n_aborted_txns: u64,          // number of aborted transactions
+    n_overwritten_pages: u64,     // number of copies overwritten by subtransactions
 }
 
 impl Database {
@@ -492,6 +497,7 @@ struct BufferManager {
 
     hash_table: Vec<BufferId>, // array containing indexes of collision chains
     buffers: Vec<PageHeader>,  // page data
+    overwritten: Vec<PageId>,  // vector of buffers with page copies overwritten in subtransactions
 }
 
 //
@@ -745,17 +751,17 @@ impl PageData {
 }
 
 impl BufferManager {
-	fn get_buffer_pid(&self, id: BufferId) -> PageId{
-		self.buffers[id as usize].pid
-	}
+    fn get_buffer_pid(&self, id: BufferId) -> PageId {
+        self.buffers[id as usize].pid
+    }
 
-	fn get_buffer_state(&self, id: BufferId) -> u16 {
-		self.buffers[id as usize].state
-	}
+    fn get_buffer_state(&self, id: BufferId) -> PageState {
+        self.buffers[id as usize].state
+    }
 
-	fn set_buffer_state(&mut self, id: BufferId, state: u16) {
-		self.buffers[id as usize].state = state
-	}
+    fn set_buffer_state(&mut self, id: BufferId, state: PageState) {
+        self.buffers[id as usize].state = state
+    }
 
     //
     // Link buffer to the head of LRU list (make it acceptable for eviction)
@@ -839,6 +845,7 @@ impl BufferManager {
         let mut buf = self.hash_table[hash];
         while buf != 0 {
             if self.buffers[buf as usize].pid == pid {
+                self.undirty_buffer(buf);
                 self.throw_buffer(buf);
                 break;
             }
@@ -879,11 +886,7 @@ impl BufferManager {
             Ok((id, 0))
         } else {
             // otherwise create new buffer
-            let (buf, evicted_pid) = self.new_buffer(new_pid)?;
-			if !try_reuse_buffer { // dirty page was copied
-				self.buffers[id as usize].state |= PAGE_OVERWRITTEN;
-			}
-			Ok((buf, evicted_pid))
+            self.new_buffer(new_pid)
         }
     }
 
@@ -938,12 +941,13 @@ impl BufferManager {
                 let victim = self.lru.prev;
                 ensure!(victim != 0);
                 debug_assert!(self.buffers[victim as usize].access_count == 0);
-                if (self.buffers[victim as usize].state & PAGE_DIRTY) != 0 {
+                let state = self.buffers[victim as usize].state;
+                if (state & PAGE_DIRTY) != 0 {
                     // remove page from dirty vector
                     self.undirty_buffer(victim);
                     evicted_pid = self.buffers[victim as usize].pid;
                 }
-                debug_assert!((self.buffers[victim as usize].state & (PAGE_BUSY | PAGE_RAW)) == 0);
+                debug_assert!((state & (PAGE_BUSY | PAGE_RAW)) == 0);
                 self.pin(victim);
                 self.remove(victim);
                 buf = victim;
@@ -999,55 +1003,83 @@ impl<'a> PageGuard<'a> {
         let old_buf = self.buf;
         let old_pid = bm.get_buffer_pid(old_buf);
         let just_modified = bm.modify_buffer(old_buf);
-        drop(bm);
 
         // Check if there is not mapping for this page in this subtransaction,
         // Allocator bitmap pages are not accessed by read-only queries, so there is no need to clone
         // bitmap pages for subtrasactions.
-        if db.cow_map.get(&old_pid).map_or(just_modified, |entry| {
-            entry.xid != db.meta.xid && !bitmap_page.is_some()
-        }) {
-            // Create copy
-            let new_pid = self.storage.allocate_page(db)?;
-			let orig_pid = if just_modified { old_pid } else { 0 };
-            db.cow_map.insert(
-                new_pid,
-                CowEntry {
-                    pid: orig_pid,
-                    xid: db.meta.xid,
-                },
-            ); // remember COW mapping
-            self.pid = new_pid;
-            let mgr = &self.storage.buf_mgr;
-            let (new_buf, evicted_pid) =
-                mgr.lock().copy_on_write(old_buf, new_pid, just_modified)?;
-            if evicted_pid != 0 {
-                // dirty page was evicted
-                let page = self.storage.pool[new_buf as usize].read();
-                self.storage
-                    .file
-                    .write_all_at(&page.data, evicted_pid as u64 * PAGE_SIZE as u64)?;
-            }
-            if new_buf != old_buf {
-                // Copy page content to the new buffer
-                let mut dst = self.storage.pool[new_buf as usize].write();
-                let src = self.storage.pool[old_buf as usize].read();
-                *dst = *src;
-                let mut bm = mgr.lock();
-                debug_assert!(bm.get_buffer_state(new_buf) == PAGE_RAW);
-                if just_modified {
-                    bm.undirty_buffer(old_buf);
+        let orig_pid: PageId;
+        match db.cow_map.get(&old_pid) {
+            None => {
+                if !just_modified {
+                    // page already marked as dirty (recusion inside allocator)
+                    return Ok(());
                 }
-                bm.release_buffer(old_buf);
-                assert!(bm.modify_buffer(new_buf));
-                self.buf = new_buf;
+                // page was not yet updated by this transactions
+                orig_pid = old_pid;
             }
-            // Prevent infinite recursion
-            if let Some(alloc_page) = bitmap_page {
-                db.meta.alloc_pages[alloc_page] = new_pid;
+            Some(entry) => {
+                // Page was created or updated by this transactions
+                if entry.xid == db.meta.xid || bitmap_page.is_some() {
+                    // Page is updated by this subtransaction or is bitmap page:
+                    // in this case we do not need to create new copy
+                    return Ok(());
+                }
+                // Overwitten page was already copied by some subtransaction.
+                // We still have to create copy to provide isolation.
+                // But this copy can be removed once this subtransaction is completed.
+                bm.overwritten.push(old_pid);
+                if entry.pid != 0 {
+                    db.pending_deletes.push(entry.pid);
+                }
+                db.cow_map.remove(&old_pid).unwrap();
+                orig_pid = 0;
             }
-            self.storage.prepare_free_page(db, old_pid)?; // prepare deallocation of original page
         }
+        drop(bm);
+
+        // Create copy
+        let new_pid = self.storage.allocate_page(db)?;
+        db.cow_map.insert(
+            new_pid,
+            CowEntry {
+                pid: orig_pid,
+                xid: db.meta.xid,
+            },
+        ); // remember COW mapping
+
+        self.pid = new_pid;
+        let mut bm = self.storage.buf_mgr.lock();
+        let (new_buf, evicted_pid) = bm.copy_on_write(old_buf, new_pid, just_modified)?;
+        if evicted_pid != 0 {
+            // dirty page was evicted
+            let page = self.storage.pool[new_buf as usize].read();
+            self.storage
+                .file
+                .write_all_at(&page.data, evicted_pid as u64 * PAGE_SIZE as u64)?;
+            self.storage
+                .n_written_pages
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if new_buf != old_buf {
+            // Copy page content to the new buffer
+            let mut dst = self.storage.pool[new_buf as usize].write();
+            let src = self.storage.pool[old_buf as usize].read();
+            *dst = *src;
+            debug_assert!(bm.get_buffer_state(new_buf) == PAGE_RAW);
+            if just_modified {
+                bm.undirty_buffer(old_buf);
+            }
+            bm.release_buffer(old_buf);
+            assert!(bm.modify_buffer(new_buf));
+            self.buf = new_buf;
+        }
+        drop(bm);
+
+        // Prevent infinite recursion
+        if let Some(alloc_page) = bitmap_page {
+            db.meta.alloc_pages[alloc_page] = new_pid;
+        }
+        self.storage.prepare_free_page(db, old_pid)?; // prepare deallocation of original page
         Ok(())
     }
 }
@@ -1062,32 +1094,29 @@ impl<'a> Drop for PageGuard<'a> {
 // Storage internal methods implementations
 //
 impl Storage {
-	//
-	// Remove dirty copy-on-write pages overwritten by completed subtransaction.
-	//
-	fn remove_redundand_copies(&self, db: &mut Database) -> Result<()> {
-		let mut overwritten_pages : Vec<PageId>;
-		{
-			let bm: &mut BufferManager = &mut self.buf_mgr.lock();
-			let overwritten_buffers: Vec<BufferId> = bm.dirty_buffers.iter().filter(|&&buf| (bm.get_buffer_state(buf) & PAGE_OVERWRITTEN) != 0).map(|&buf| buf).collect();
-			overwritten_pages = Vec::with_capacity(overwritten_buffers.len());
-			for buf in overwritten_buffers {
-				assert!(bm.buffers[buf as usize].access_count == 0);
-				overwritten_pages.push(bm.get_buffer_pid(buf));
-                bm.undirty_buffer(buf);
-				bm.throw_buffer(buf);
-			}
-		}
-		for pid in overwritten_pages {
-			self.free_page(db, pid)?;
-		}
-		Ok(())
-	}
+    //
+    // Remove copy-on-write pages overwritten by completed subtransaction.
+    //
+    fn remove_redundand_copies(&self, db: &mut Database) -> Result<()> {
+        let mut overwritten: Vec<PageId> = Vec::new();
+        let mut bm = self.buf_mgr.lock();
+        std::mem::swap(&mut bm.overwritten, &mut overwritten);
+        db.n_overwritten_pages += overwritten.len() as u64;
+        for pid in &overwritten {
+            bm.forget_buffer(*pid);
+        }
+        db.overwritten_pages.append(&mut overwritten);
+        Ok(())
+    }
 
     //
     // Allocate page
     //
     fn allocate_page(&self, db: &mut Database) -> Result<PageId> {
+        // Fast path: try to reuse overwritten page
+        if let Some(pid) = db.overwritten_pages.pop() {
+            return Ok(pid);
+        }
         db.n_alloc_pages += 1;
         //
         // Cyclic scan of bitmap pages. We start with position pointed by (alloc_page,alloc_page_pos)
@@ -1179,9 +1208,14 @@ impl Storage {
                 assert!(self.pool[pin.buf as usize].write().test_and_set_bit(bit))
             }
             BitmapOp::Clear => {
-                // Set allocator's current position to just deallocated page to force its reusing
-                db.alloc_page = alloc_page;
-                db.alloc_page_pos = bit / 8;
+                // Set allocator's current position if deallocated page is before it
+                let alloc_page_pos = bit / 8;
+                if alloc_page < db.alloc_page
+                    || (alloc_page == db.alloc_page && alloc_page_pos < db.alloc_page_pos)
+                {
+                    db.alloc_page = alloc_page;
+                    db.alloc_page_pos = alloc_page_pos;
+                }
                 self.pool[pin.buf as usize].write().clear_bit(bit)
             }
         }
@@ -1246,6 +1280,8 @@ impl Storage {
             // dirty page was evicted
             self.file
                 .write_all_at(&mut page.data, evicted_pid as u64 * PAGE_SIZE as u64)?;
+            self.n_written_pages
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         page.data.fill(0u8);
         assert!(bm.modify_buffer(buf));
@@ -1270,6 +1306,8 @@ impl Storage {
             let page = self.pool[buf as usize].read();
             self.file
                 .write_all_at(&page.data, evicted_pid as u64 * PAGE_SIZE as u64)?;
+            self.n_written_pages
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if (state & PAGE_BUSY) != 0 {
             // Some other thread is loading buffer: just wait until it done
@@ -1358,9 +1396,17 @@ impl Storage {
             for pg in &pending_deletes {
                 self.prepare_free_page(db, *pg)?;
             }
+            let mut overwritten_pages: Vec<PageId> = Vec::new();
+            std::mem::swap(&mut db.overwritten_pages, &mut overwritten_pages);
+            for pg in &overwritten_pages {
+                self.prepare_free_page(db, *pg)?;
+            }
             // ... then actually do it
             let n_alloc_pages = db.n_alloc_pages;
             for pg in &pending_deletes {
+                self.free_page(db, *pg)?;
+            }
+            for pg in &overwritten_pages {
                 self.free_page(db, *pg)?;
             }
             // Delete original pages (them should be already prepared)
@@ -1383,10 +1429,19 @@ impl Storage {
             db.meta.xid = db.meta.xid.wrapping_add(1);
             let meta = db.meta.pack();
             self.file.write_all_at(&meta, 0)?;
+            self.n_written_pages
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if !self.conf.nosync {
                 self.file.sync_all()?;
             }
-
+            info!(
+                "Written pages {}, optimized overwritten pages {}, used pages {}, database size {}",
+                self.n_written_pages
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                db.n_overwritten_pages,
+                db.meta.used,
+                db.meta.size,
+            );
             db.n_committed_txns += 1;
 
             let mut meta_shadow = self.meta_shadow.write();
@@ -1407,6 +1462,8 @@ impl Storage {
             let file_offs = pid as u64 * PAGE_SIZE as u64;
             let page = self.pool[buf].read();
             self.file.write_all_at(&page.data, file_offs)?;
+            self.n_written_pages
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             debug_assert!((bm.buffers[buf].state & PAGE_DIRTY) != 0);
             bm.buffers[buf].state = 0;
         }
@@ -1445,6 +1502,7 @@ impl Storage {
 
             db.n_aborted_txns += 1;
             db.pending_deletes.clear();
+            db.overwritten_pages.clear();
         }
     }
 
@@ -1497,12 +1555,14 @@ impl Storage {
                 pinned: 1,
                 hash_table: vec![0; conf.cache_size],
                 buffers: vec![PageHeader::new(); conf.cache_size],
+                overwritten: Vec::new(),
             }),
             pool: iter::repeat_with(|| RwLock::new(PageData::new()))
                 .take(conf.cache_size)
                 .collect(),
             file,
             conf,
+            n_written_pages: AtomicU64::new(0),
             meta_shadow: RwLock::new(ShadowMetadata {
                 snapshot: meta,
                 committed: meta,
@@ -1513,10 +1573,12 @@ impl Storage {
                 alloc_page_pos: 0,
                 cow_map: HashMap::new(),
                 pending_deletes: Vec::new(),
+                overwritten_pages: Vec::new(),
                 n_alloc_pages: 0,
                 n_free_pages: 0,
                 n_committed_txns: 0,
                 n_aborted_txns: 0,
+                n_overwritten_pages: 0,
             }),
         };
         Ok(storage)
@@ -2214,10 +2276,10 @@ impl<'a> Transaction<'_> {
         self.db.meta.xid = self.db.meta.xid.wrapping_add(1);
         let mut meta = self.storage.meta_shadow.write();
         meta.snapshot.update(&self.db.meta);
-		self.storage.remove_redundand_copies(&mut self.db)?;
+        self.storage.remove_redundand_copies(&mut self.db)?;
         // mark transaction as committed to prevent implicit rollback by destructor
         self.status = TransactionStatus::Committed;
-		Ok(())
+        Ok(())
     }
 
     ///
