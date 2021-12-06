@@ -1,6 +1,6 @@
 [package]
 name = "yakv"
-version = "0.2.6"
+version = "0.2.7"
 authors = ["Konstantin Knizhnik <knizhnik@garret.ru>"]
 edition = "2018"
 license = "MIT OR Apache-2.0"
@@ -14,7 +14,6 @@ readme = "README.md"
 fs2 = "0.4.3"
 anyhow = "1.0"
 parking_lot = "0.11.2"
-tracing = "0.1.27"
 
 [dev-dependencies]
 rand = "0.8.3"

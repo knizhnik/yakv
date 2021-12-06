@@ -10,8 +10,6 @@ use std::ops::Bound::*;
 use std::ops::{Bound, RangeBounds};
 use std::os::unix::prelude::FileExt as UnixFileExt;
 use std::path::Path;
-use std::sync::atomic::AtomicU64;
-use tracing::*;
 
 type PageId = u32; // address of page in the file
 type PageState = u16; // page state bit mask
@@ -373,7 +371,6 @@ pub struct Storage {
     busy_events: [Condvar; N_BUSY_EVENTS],
     pool: Vec<RwLock<PageData>>,
     file: File,
-    n_written_pages: AtomicU64,
     conf: StorageConfig,
 }
 
@@ -1056,9 +1053,6 @@ impl<'a> PageGuard<'a> {
             self.storage
                 .file
                 .write_all_at(&page.data, evicted_pid as u64 * PAGE_SIZE as u64)?;
-            self.storage
-                .n_written_pages
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if new_buf != old_buf {
             // Copy page content to the new buffer
@@ -1280,8 +1274,6 @@ impl Storage {
             // dirty page was evicted
             self.file
                 .write_all_at(&mut page.data, evicted_pid as u64 * PAGE_SIZE as u64)?;
-            self.n_written_pages
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         page.data.fill(0u8);
         assert!(bm.modify_buffer(buf));
@@ -1306,8 +1298,6 @@ impl Storage {
             let page = self.pool[buf as usize].read();
             self.file
                 .write_all_at(&page.data, evicted_pid as u64 * PAGE_SIZE as u64)?;
-            self.n_written_pages
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if (state & PAGE_BUSY) != 0 {
             // Some other thread is loading buffer: just wait until it done
@@ -1429,19 +1419,9 @@ impl Storage {
             db.meta.xid = db.meta.xid.wrapping_add(1);
             let meta = db.meta.pack();
             self.file.write_all_at(&meta, 0)?;
-            self.n_written_pages
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if !self.conf.nosync {
                 self.file.sync_all()?;
             }
-            info!(
-                "Written pages {}, optimized overwritten pages {}, used pages {}, database size {}",
-                self.n_written_pages
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                db.n_overwritten_pages,
-                db.meta.used,
-                db.meta.size,
-            );
             db.n_committed_txns += 1;
 
             let mut meta_shadow = self.meta_shadow.write();
@@ -1462,8 +1442,6 @@ impl Storage {
             let file_offs = pid as u64 * PAGE_SIZE as u64;
             let page = self.pool[buf].read();
             self.file.write_all_at(&page.data, file_offs)?;
-            self.n_written_pages
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             debug_assert!((bm.buffers[buf].state & PAGE_DIRTY) != 0);
             bm.buffers[buf].state = 0;
         }
@@ -1562,7 +1540,6 @@ impl Storage {
                 .collect(),
             file,
             conf,
-            n_written_pages: AtomicU64::new(0),
             meta_shadow: RwLock::new(ShadowMetadata {
                 snapshot: meta,
                 committed: meta,
