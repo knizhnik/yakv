@@ -1,6 +1,8 @@
 use anyhow::{ensure, Result};
 use fs2::FileExt;
-use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{
+    Condvar, Mutex, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard,
+};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::convert::TryInto;
@@ -102,7 +104,7 @@ pub enum TransactionStatus {
 pub struct Transaction<'a> {
     pub status: TransactionStatus,
     storage: &'a Storage,
-    db: RwLockWriteGuard<'a, Database>,
+    db: Option<RwLockWriteGuard<'a, Database>>,
 }
 
 ///
@@ -1365,69 +1367,77 @@ impl Storage {
         Transaction {
             status: TransactionStatus::InProgress,
             storage: self,
-            db: self.db.write(),
+            db: Some(self.db.write()),
         }
     }
 
-    fn commit(&self, db: &mut Database) -> Result<()> {
-        let result = self.try_commit(db);
-        if result.is_err() {
-            self.rollback(db);
-        }
-        result
-    }
-
-    fn try_commit(&self, db: &mut Database) -> Result<()> {
-        // Check if something was changed
+    fn commit(&self, mut db: RwLockWriteGuard<Database>) -> Result<()> {
         if db.is_modified() {
-            // First prepare deallocation...
-            let mut pending_deletes: Vec<PageId> = Vec::new();
-            std::mem::swap(&mut db.pending_deletes, &mut pending_deletes);
-            for pg in &pending_deletes {
-                self.prepare_free_page(db, *pg)?;
+            let mut result = self.commit_phase1(&mut db);
+            if result.is_err() {
+                self.rollback(&mut db);
+            } else {
+                let db = RwLockWriteGuard::downgrade_to_upgradable(db);
+                result = self.commit_phase2(&db);
+                if result.is_err() {
+                    let mut db = RwLockUpgradableReadGuard::upgrade(db);
+                    self.restore_metadata(&mut db);
+                }
             }
-            let mut overwritten_pages: Vec<PageId> = Vec::new();
-            std::mem::swap(&mut db.overwritten_pages, &mut overwritten_pages);
-            for pg in &overwritten_pages {
-                self.prepare_free_page(db, *pg)?;
-            }
-            // ... then actually do it
-            let n_alloc_pages = db.n_alloc_pages;
-            for pg in &pending_deletes {
-                self.free_page(db, *pg)?;
-            }
-            for pg in &overwritten_pages {
-                self.free_page(db, *pg)?;
-            }
-            // Delete original pages (them should be already prepared)
-            let orig: Vec<PageId> = db
-                .cow_map
-                .iter()
-                .map(|(_new, entry)| entry.pid)
-                .filter(|pid| *pid != 0)
-                .collect();
-            for pid in orig {
-                self.free_page(db, pid)?;
-            }
-            assert!(n_alloc_pages == db.n_alloc_pages); // no allocation should happen during deallocation
-            db.cow_map.clear();
-
-            self.flush_buffers()?;
-            if !self.conf.nosync {
-                self.file.sync_all()?;
-            }
-            db.meta.xid = db.meta.xid.wrapping_add(1);
-            let meta = db.meta.pack();
-            self.file.write_all_at(&meta, 0)?;
-            if !self.conf.nosync {
-                self.file.sync_all()?;
-            }
-            db.n_committed_txns += 1;
-
-            let mut meta_shadow = self.meta_shadow.write();
-            meta_shadow.committed = db.meta;
-            meta_shadow.snapshot.update(&db.meta);
+            return result;
         }
+        Ok(())
+    }
+
+    fn commit_phase1(&self, db: &mut Database) -> Result<()> {
+        // First prepare deallocation...
+        let mut pending_deletes: Vec<PageId> = Vec::new();
+        std::mem::swap(&mut db.pending_deletes, &mut pending_deletes);
+        for pg in &pending_deletes {
+            self.prepare_free_page(db, *pg)?;
+        }
+        let mut overwritten_pages: Vec<PageId> = Vec::new();
+        std::mem::swap(&mut db.overwritten_pages, &mut overwritten_pages);
+        for pg in &overwritten_pages {
+            self.prepare_free_page(db, *pg)?;
+        }
+        // ... then actually do it
+        let n_alloc_pages = db.n_alloc_pages;
+        for pg in &pending_deletes {
+            self.free_page(db, *pg)?;
+        }
+        for pg in &overwritten_pages {
+            self.free_page(db, *pg)?;
+        }
+        // Delete original pages (them should be already prepared)
+        let orig: Vec<PageId> = db
+            .cow_map
+            .iter()
+            .map(|(_new, entry)| entry.pid)
+            .filter(|pid| *pid != 0)
+            .collect();
+        for pid in orig {
+            self.free_page(db, pid)?;
+        }
+        assert!(n_alloc_pages == db.n_alloc_pages); // no allocation should happen during deallocation
+        db.cow_map.clear();
+        Ok(())
+    }
+
+    fn commit_phase2(&self, db: &Database) -> Result<()> {
+        self.flush_buffers()?;
+        if !self.conf.nosync {
+            self.file.sync_all()?;
+        }
+        let meta = db.meta.pack();
+        self.file.write_all_at(&meta, 0)?;
+        if !self.conf.nosync {
+            self.file.sync_all()?;
+        }
+
+        let mut meta_shadow = self.meta_shadow.write();
+        meta_shadow.committed = db.meta;
+        meta_shadow.snapshot.update(&db.meta);
         Ok(())
     }
 
@@ -1471,17 +1481,21 @@ impl Storage {
             for (new_pid, _entry) in &cow_map {
                 bm.forget_buffer(*new_pid);
             }
-            // restore old metadata state but preserve current XID
-            let mut meta_shadow = self.meta_shadow.write();
-            let xid = db.meta.xid;
-            db.meta = meta_shadow.committed;
-            db.meta.xid = xid;
-            meta_shadow.snapshot.update(&db.meta);
+            self.restore_metadata(db);
 
             db.n_aborted_txns += 1;
             db.pending_deletes.clear();
             db.overwritten_pages.clear();
         }
+    }
+
+    fn restore_metadata(&self, db: &mut Database) {
+        // restore old metadata state but preserve current XID
+        let mut meta_shadow = self.meta_shadow.write();
+        let xid = db.meta.xid;
+        db.meta = meta_shadow.committed;
+        db.meta.xid = xid;
+        meta_shadow.snapshot.update(&db.meta);
     }
 
     ///
@@ -2095,7 +2109,8 @@ impl Storage {
     ) -> Result<()> {
         let mut db = self.db.write(); // prevent concurrent modification of the database (MURSIW)
         self.do_updates(&mut db, to_upsert, to_remove)?;
-        self.commit(&mut db)
+        self.commit(db)?;
+        Ok(())
     }
 
     ///
@@ -2213,10 +2228,10 @@ impl Select for Storage {
 
 impl Drop for Storage {
     fn drop(&mut self) {
-        let mut db = self.db.write();
+        let db = self.db.write();
         // Complete delayed commit
         if db.is_modified() {
-            self.commit(&mut db).unwrap();
+            self.commit(db).unwrap();
         }
     }
 }
@@ -2239,7 +2254,7 @@ impl<'a> Transaction<'_> {
     /// Commit transaction
     ///
     pub fn commit(mut self) -> Result<()> {
-        self.storage.commit(&mut self.db)?;
+        self.storage.commit(self.db.take().unwrap())?;
         self.status = TransactionStatus::Committed;
         Ok(())
     }
@@ -2250,10 +2265,11 @@ impl<'a> Transaction<'_> {
     /// Rollback cause abort of all subtransactins.
     ///
     pub fn subcommit(mut self) -> Result<()> {
-        self.db.meta.xid = self.db.meta.xid.wrapping_add(1);
+        let mut db = self.db.as_mut().unwrap();
+        db.meta.xid = db.meta.xid.wrapping_add(1);
         let mut meta = self.storage.meta_shadow.write();
-        meta.snapshot.update(&self.db.meta);
-        self.storage.remove_redundand_copies(&mut self.db)?;
+        meta.snapshot.update(&db.meta);
+        self.storage.remove_redundand_copies(&mut db)?;
         // mark transaction as committed to prevent implicit rollback by destructor
         self.status = TransactionStatus::Committed;
         Ok(())
@@ -2272,7 +2288,8 @@ impl<'a> Transaction<'_> {
     /// Rollback transaction undoing all changes
     ///
     pub fn rollback(mut self) -> Result<()> {
-        self.storage.rollback(&mut self.db);
+        let mut db = self.db.as_mut().unwrap();
+        self.storage.rollback(&mut db);
         self.status = TransactionStatus::Aborted;
         Ok(())
     }
@@ -2281,7 +2298,8 @@ impl<'a> Transaction<'_> {
     /// Insert new key in the storage or update existed key as part of this transaction.
     ///
     pub fn put(&mut self, key: &Key, value: &Value) -> Result<()> {
-        self.storage.do_upsert(&mut self.db, key, value)?;
+        let mut db = self.db.as_mut().unwrap();
+        self.storage.do_upsert(&mut db, key, value)?;
         Ok(())
     }
 
@@ -2304,7 +2322,8 @@ impl<'a> Transaction<'_> {
     /// Does nothing if key not exist.
     ///
     pub fn remove(&mut self, key: &Key) -> Result<()> {
-        self.storage.do_remove(&mut self.db, key)?;
+        let mut db = self.db.as_mut().unwrap();
+        self.storage.do_remove(&mut db, key)?;
         Ok(())
     }
 
@@ -2326,7 +2345,8 @@ impl<'a> Transaction<'_> {
     /// Get database info
     ///
     pub fn get_database_info(&self) -> DatabaseInfo {
-        self.db.get_info()
+        let db = self.db.as_ref().unwrap();
+        db.get_info()
     }
 
     ///
@@ -2342,9 +2362,10 @@ impl<'a> Select for Transaction<'_> {
     /// Returns bidirectional iterator
     ///
     fn range<R: RangeBounds<Key>>(&self, range: R) -> StorageIterator<'_> {
+        let db = self.db.as_ref().unwrap();
         StorageIterator {
             storage: self.storage,
-            meta: Some(&self.db.meta),
+            meta: Some(&db.meta),
             from: range.start_bound().cloned(),
             till: range.end_bound().cloned(),
             left: TreePath::new(),
@@ -2356,7 +2377,8 @@ impl<'a> Select for Transaction<'_> {
 impl<'a> Drop for Transaction<'a> {
     fn drop(&mut self) {
         if self.status == TransactionStatus::InProgress {
-            self.storage.rollback(&mut self.db);
+            let mut db = self.db.as_mut().unwrap();
+            self.storage.rollback(&mut db);
         }
     }
 }
