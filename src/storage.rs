@@ -38,7 +38,7 @@ const VERSION: u32 = 1;
 const N_BITMAP_PAGES: usize = PAGE_SIZE / 4 - 8; // number of memory allocator bitmap pages
 const ALLOC_BITMAP_SIZE: usize = PAGE_SIZE * 8; // number of pages mapped by one allocator bitmap page
 const PAGE_HEADER_SIZE: usize = 2; // now page header contains just number of items in the page
-const MAX_VALUE_LEN: usize = PAGE_SIZE / 4; // assume that pages may fit at least 3 items
+const MAX_ITEM_LEN: usize = (PAGE_SIZE - PAGE_HEADER_SIZE - 4*2) / 4; // assume that pages may fit at least 3 items
 const MAX_KEY_LEN: usize = u8::MAX as usize; // should fit in one byte
 const N_BUSY_EVENTS: usize = 8; // number of condition variables used for waiting read completion
 
@@ -1790,7 +1790,7 @@ impl Storage {
     // Insert or update key in the storage
     //
     fn do_upsert(&self, db: &mut Database, key: &Key, value: &Value) -> Result<()> {
-        ensure!(key.len() != 0 && key.len() <= MAX_KEY_LEN && value.len() <= MAX_VALUE_LEN);
+        ensure!(key.len() != 0 && key.len() <= MAX_KEY_LEN && 1 + key.len() + value.len() <= MAX_ITEM_LEN);
         if db.meta.root == 0 {
             db.meta.root = self.btree_allocate_leaf_page(db, key, value)?;
             db.meta.height = 1;
