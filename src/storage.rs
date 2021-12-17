@@ -37,9 +37,8 @@ const MAGIC: u32 = 0xBACE2021;
 const VERSION: u32 = 1;
 const N_BITMAP_PAGES: usize = PAGE_SIZE / 4 - 8; // number of memory allocator bitmap pages
 const ALLOC_BITMAP_SIZE: usize = PAGE_SIZE * 8; // number of pages mapped by one allocator bitmap page
-const PAGE_HEADER_SIZE: usize = 2; // now page header contains just number of items in the page
-const MAX_ITEM_LEN: usize = (PAGE_SIZE - PAGE_HEADER_SIZE - 4*2) / 4; // assume that pages may fit at least 3 items
-const MAX_KEY_LEN: usize = u8::MAX as usize; // should fit in one byte
+const PAGE_HEADER_SIZE: usize = 4; // number of items + payload size
+const MAX_ITEM_LEN: usize = (PAGE_SIZE - PAGE_HEADER_SIZE - 4 * 2) / 4; // assume that pages may fit at least 3 items
 const N_BUSY_EVENTS: usize = 8; // number of condition variables used for waiting read completion
 
 // Flags for page state
@@ -520,22 +519,32 @@ impl PageData {
         self.set_u16(PAGE_HEADER_SIZE + ip * 2, offs as u16)
     }
 
+    fn get_len(&self, offs: usize) -> (usize, usize) {
+        let len = self.data[offs] as usize;
+        if (len & 0x80) != 0 {
+            (2, ((len & 0x7F) << 8) | (self.data[offs + 1] as usize))
+        } else {
+            (1, len)
+        }
+    }
+
     fn get_child(&self, ip: ItemPointer) -> PageId {
         let offs = self.get_offs(ip);
-        let key_len = self.data[offs] as usize;
-        self.get_u32(offs + key_len + 1)
+        let (hdr_len, key_len) = self.get_len(offs);
+        self.get_u32(offs + hdr_len + key_len + 1)
     }
 
     fn set_child(&mut self, ip: ItemPointer, pid: PageId) {
         let offs = self.get_offs(ip);
-        let key_len = self.data[offs] as usize;
-        self.set_u32(offs + key_len + 1, pid)
+        let (hdr_len, key_len) = self.get_len(offs);
+        debug_assert!(self.data[offs + key_len + hdr_len] == 4);
+        self.set_u32(offs + key_len + hdr_len + 1, pid)
     }
 
     fn get_key(&self, ip: ItemPointer) -> Key {
         let offs = self.get_offs(ip);
-        let key_len = self.data[offs] as usize;
-        self.data[offs + 1..offs + 1 + key_len].to_vec()
+        let (hdr_len, key_len) = self.get_len(offs);
+        self.data[offs + hdr_len..offs + hdr_len + key_len].to_vec()
     }
 
     fn get_last_key(&self) -> Key {
@@ -544,23 +553,30 @@ impl PageData {
     }
 
     fn get_item(&self, ip: ItemPointer) -> (Key, Value) {
-        let (item_offs, item_len) = self.get_item_offs_len(ip);
-        let key_len = self.data[item_offs] as usize;
+        let item_offs = self.get_offs(ip);
+        let (key_hdr_len, key_len) = self.get_len(item_offs);
+        let (val_hdr_len, val_len) = self.get_len(item_offs + key_hdr_len + key_len);
+        let key_offs = item_offs + key_hdr_len;
+        let val_offs = key_offs + key_len + val_hdr_len;
         (
-            self.data[item_offs + 1..item_offs + 1 + key_len].to_vec(),
-            self.data[item_offs + 1 + key_len..item_offs + item_len].to_vec(),
+            self.data[key_offs..key_offs + key_len].to_vec(),
+            self.data[val_offs..val_offs + val_len].to_vec(),
         )
     }
 
-    fn get_item_offs_len(&self, ip: ItemPointer) -> (usize, usize) {
-        let offs = self.get_offs(ip);
-        let next_offs = if ip == 0 {
-            PAGE_SIZE
+    fn set_value(&mut self, offs: usize, val: &[u8]) -> usize {
+        let len = val.len();
+        debug_assert!(len <= 0x7FFF);
+        if len < 0x80 {
+            self.data[offs] = len as u8;
+            self.copy(offs + 1, val);
+            offs + 1 + len
         } else {
-            self.get_offs(ip - 1)
-        };
-        debug_assert!(next_offs > offs);
-        (offs, next_offs - offs)
+            self.data[offs] = (len >> 8) as u8 | 0x80;
+            self.data[offs + 1] = (len & 0xFF) as u8;
+            self.copy(offs + 2, val);
+            offs + 2 + len
+        }
     }
 
     fn set_u16(&mut self, offs: usize, data: u16) {
@@ -611,17 +627,16 @@ impl PageData {
         self.get_u16(0) as ItemPointer
     }
 
-    fn get_size(&self) -> ItemPointer {
-        let n_items = self.get_n_items();
-        if n_items == 0 {
-            0
-        } else {
-            PAGE_SIZE - self.get_offs(n_items - 1)
-        }
-    }
-
     fn set_n_items(&mut self, n_items: ItemPointer) {
         self.set_u16(0, n_items as u16)
+    }
+
+    fn get_size(&self) -> usize {
+        self.get_u16(2) as usize
+    }
+
+    fn set_size(&mut self, size: usize) {
+        self.set_u16(2, size as u16)
     }
 
     fn copy(&mut self, offs: usize, data: &[u8]) {
@@ -631,37 +646,43 @@ impl PageData {
 
     fn compare_key(&self, ip: ItemPointer, key: &Key) -> Ordering {
         let offs = self.get_offs(ip);
-        let key_len = self.data[offs] as usize;
+        let (hdr_len, key_len) = self.get_len(offs);
         if key_len == 0 {
             // special handling of +inf in right-most internal nodes
             Ordering::Less
         } else {
-            key[..].cmp(&self.data[offs + 1..offs + 1 + key_len])
+            key[..].cmp(&self.data[offs + hdr_len..offs + hdr_len + key_len])
         }
+    }
+
+    fn get_item_offs_len(&mut self, ip: ItemPointer) -> (usize, usize) {
+        let offs = self.get_offs(ip);
+        let (key_hdr_len, key_len) = self.get_len(offs);
+        let (val_hdr_len, val_len) = self.get_len(offs + key_hdr_len + key_len);
+        (offs, key_hdr_len + key_len + val_hdr_len + val_len)
     }
 
     fn remove_key(&mut self, ip: ItemPointer, leaf: bool) {
         let n_items = self.get_n_items();
-        let size = self.get_size();
-        let (item_offs, item_len) = self.get_item_offs_len(ip);
-        for i in ip + 1..n_items {
-            self.set_offs(i - 1, self.get_offs(i) + item_len);
-        }
-        let items_origin = PAGE_SIZE - size;
         if !leaf && n_items > 1 && ip + 1 == n_items {
             // If we are removing last child of internal page then copy it's key to the previous item
-            let prev_item_offs = item_offs + item_len;
-            let key_len = self.data[item_offs] as usize;
-            let prev_key_len = self.data[prev_item_offs] as usize;
-            let new_offs = prev_item_offs + prev_key_len - key_len;
-            self.set_offs(ip - 1, new_offs);
-            self.data
-                .copy_within(item_offs..item_offs + prev_key_len + 1, new_offs);
+            self.set_child(ip, self.get_child(ip - 1));
+            self.set_offs(ip - 1, self.get_offs(ip));
         } else {
+            let ip_offs = PAGE_HEADER_SIZE + ip * 2;
             self.data
-                .copy_within(items_origin..item_offs, items_origin + item_len);
+                .copy_within(ip_offs + 2..PAGE_HEADER_SIZE + n_items * 2, ip_offs);
         }
         self.set_n_items(n_items - 1);
+    }
+
+    fn encoding_bytes(len: usize) -> usize {
+        debug_assert!(len <= 0x7FFF);
+        if len < 0x80 {
+            1
+        } else {
+            2
+        }
     }
 
     //
@@ -671,29 +692,40 @@ impl PageData {
         let n_items = self.get_n_items();
         let size = self.get_size();
         let key_len = key.len();
-        let item_len = 1 + key_len + value.len();
+        let value_len = value.len();
+        let item_len =
+            key_len + Self::encoding_bytes(key_len) + value_len + Self::encoding_bytes(value_len);
         if (n_items + 1) * 2 + size + item_len <= PAGE_SIZE - PAGE_HEADER_SIZE {
             // fit in page
-            for i in (ip..n_items).rev() {
-                self.set_offs(i + 1, self.get_offs(i) - item_len);
-            }
-            let item_offs = if ip != 0 {
-                self.get_offs(ip - 1) - item_len
-            } else {
-                PAGE_SIZE - item_len
-            };
-            self.set_offs(ip, item_offs);
-            let items_origin = PAGE_SIZE - size;
+            let item_offs = PAGE_SIZE - size - item_len;
+            let ip_offs = PAGE_HEADER_SIZE + ip * 2;
             self.data
-                .copy_within(items_origin..item_offs + item_len, items_origin - item_len);
-            self.data[item_offs] = key_len as u8;
-            self.data[item_offs + 1..item_offs + 1 + key_len].copy_from_slice(&key);
-            self.data[item_offs + 1 + key_len..item_offs + item_len].copy_from_slice(&value);
+                .copy_within(ip_offs..PAGE_HEADER_SIZE + n_items * 2, ip_offs + 2);
+            self.set_offs(ip, item_offs);
+            let value_offs = self.set_value(item_offs, &key);
+            let end_offs = self.set_value(value_offs, value);
+            debug_assert!(end_offs == item_offs + item_len);
             self.set_n_items(n_items + 1);
+            self.set_size(size + item_len);
             true
         } else {
             false
         }
+    }
+
+    fn compact(&mut self) -> bool {
+        let n_items = self.get_n_items();
+        let mut page = [0u8; PAGE_SIZE];
+        let mut dst = PAGE_SIZE;
+        for ip in 0..n_items {
+            let (item_offs, item_len) = self.get_item_offs_len(ip);
+            dst -= item_len;
+            page[dst..dst + item_len].copy_from_slice(&self.data[item_offs..item_offs + item_len]);
+            self.set_offs(ip, dst);
+        }
+        self.data[dst..].copy_from_slice(&page[dst..]);
+        self.set_size(PAGE_SIZE - dst);
+        true
     }
 
     //
@@ -742,6 +774,8 @@ impl PageData {
         let src = PAGE_SIZE - size;
         self.data.copy_within(src..dst, src + moved_size);
         new_page.set_n_items(r + 1);
+        new_page.set_size(moved_size);
+        self.set_size(size - moved_size);
         self.set_n_items(n_items - r - 1);
         r
     }
@@ -1592,6 +1626,7 @@ impl Storage {
         let pin = self.new_page(db)?;
         let mut page = self.pool[pin.buf as usize].write();
         page.set_n_items(0);
+        page.set_size(0);
         page.insert_item(0, key, value);
         Ok(pin.pid)
     }
@@ -1609,6 +1644,7 @@ impl Storage {
         let pin = self.new_page(db)?;
         let mut page = self.pool[pin.buf as usize].write();
         page.set_n_items(0);
+        page.set_size(0);
         debug_assert!(left_child != 0);
         debug_assert!(right_child != 0);
         page.insert_item(0, key, &left_child.to_be_bytes().to_vec());
@@ -1629,7 +1665,9 @@ impl Storage {
         key: &Key,
         value: &Value,
     ) -> Result<Option<(Key, PageId)>> {
-        if !page.insert_item(ip, key, value) {
+        if !page.insert_item(ip, key, value)
+            && (!page.compact() || !page.insert_item(ip, key, value))
+        {
             // page is full then divide page
             let pin = self.new_page(db)?;
             let mut new_page = self.pool[pin.buf as usize].write();
@@ -1790,7 +1828,7 @@ impl Storage {
     // Insert or update key in the storage
     //
     fn do_upsert(&self, db: &mut Database, key: &Key, value: &Value) -> Result<()> {
-        ensure!(key.len() != 0 && key.len() <= MAX_KEY_LEN && 1 + key.len() + value.len() <= MAX_ITEM_LEN);
+        ensure!(key.len() != 0 && 4 + key.len() + value.len() <= MAX_ITEM_LEN);
         if db.meta.root == 0 {
             db.meta.root = self.btree_allocate_leaf_page(db, key, value)?;
             db.meta.height = 1;
